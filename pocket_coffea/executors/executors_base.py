@@ -3,6 +3,146 @@ from abc import ABC, abstractmethod
 from coffea import processor as coffea_processor
 from pocket_coffea.utils.network import get_proxy_path
 
+from coffea.processor import Runner, accumulate, executor
+from collections.abc import Awaitable, Generator, Iterable, Mapping, MutableMapping
+from typing import (
+    Iterable,
+    Callable,
+    Optional,
+    List,
+    Set,
+    Generator,
+    Dict,
+    Union,
+    Tuple,
+    Awaitable,
+)
+from coffea.processor import ProcessorABC, DaskExecutor, TaskVineExecutor, WorkQueueExecutor, Accumulatable
+
+ExecutorBase = executor.ExecutorBase
+
+
+import threading
+import awkward as ak
+
+from functools import partial
+from dataclasses import dataclass, field
+import lz4.frame as lz4f
+
+from rich import print as rprint
+
+from coffea.util import save, rich_bar
+
+
+@dataclass
+class IterativeExecutorAlt(ExecutorBase):
+    """Execute in one thread iteratively
+
+    Parameters
+    ----------
+        items : list
+            List of input arguments
+        function : callable
+            A function to be called on each input, which returns an accumulator instance
+        accumulator : Accumulatable
+            An accumulator to collect the output of the function
+        status : bool
+            If true (default), enable progress bar
+        unit : str
+            Label of progress bar unit
+        desc : str
+            Label of progress bar description
+        compression : int, optional
+            Ignored for iterative executor
+    """
+
+    workers: int = 1
+
+    def __call__(
+        self,
+        items: Iterable,
+        function: Callable,
+        accumulator: Accumulatable,
+    ):
+        if len(items) == 0:
+            return accumulator
+        """
+        print("start iterative executor")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        with rich_bar() as progress:
+            print("start rich bar")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+            p_id = progress.add_task(
+                self.desc, total=len(items), unit=self.unit, disable=not self.status
+            )
+            print("start accumulate")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+            return (
+                accumulate(
+                    progress.track(
+                        map(function, (c for c in items)),
+                        total=len(items),
+                        task_id=p_id,
+                    ),
+                    accumulator,
+                ),
+                0,
+            )
+        """
+
+        print("start iterative executor")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        results = []
+        for item in items:
+            print("start function")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+            print("type of function:", type(function))
+            result = function(item)
+            print("end function")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+            results.append(result)
+        print("end iterative executor")
+
+        return (
+                accumulate(
+                    results,
+                    accumulator,
+                ),
+                0,
+            )
+
+
 class ExecutorFactoryABC(ABC):
 
     def __init__(self, run_options, **kwargs):
@@ -55,7 +195,7 @@ class IterativeExecutorFactory(ExecutorFactoryABC):
         super().__init__(run_options, **kwargs)
 
     def get(self):
-        return coffea_processor.iterative_executor(**self.customized_args())
+        return IterativeExecutorAlt(**self.customized_args())
 
 
 class FuturesExecutorFactory(ExecutorFactoryABC):

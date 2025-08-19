@@ -10,9 +10,30 @@ import click
 import time
 from rich import print as rprint
 
-from coffea.util import save
+from coffea.util import save, rich_bar
 from coffea import processor
-from coffea.processor import Runner
+from coffea.processor import Runner, accumulate
+from coffea.nanoevents import schemas, NanoEventsFactory
+from collections.abc import Awaitable, Generator, Iterable, Mapping, MutableMapping
+from typing import (
+    Iterable,
+    Callable,
+    Optional,
+    List,
+    Set,
+    Generator,
+    Dict,
+    Union,
+    Tuple,
+    Awaitable,
+)
+
+import uproot
+import uuid
+from dataclasses import asdict
+#from coffea.nanoevents import LazyDataFrame, ParquetFileContext
+
+from coffea.processor import ProcessorABC, DaskExecutor, TaskVineExecutor, WorkQueueExecutor, Accumulatable
 
 from pocket_coffea.utils.configurator import Configurator
 from pocket_coffea.utils.utils import load_config, path_import, adapt_chunksize
@@ -21,6 +42,439 @@ from pocket_coffea.utils.time import wait_until
 from pocket_coffea.parameters import defaults as parameters_utils
 from pocket_coffea.executors import executors_base, executors_manual_jobs
 from pocket_coffea.utils.benchmarking import print_processing_stats
+
+import threading
+import awkward as ak
+
+from functools import partial
+from dataclasses import dataclass, field
+import lz4.frame as lz4f
+
+@dataclass(unsafe_hash=True, frozen=True)
+class WorkItem:
+    dataset: str
+    filename: str
+    treename: str
+    entrystart: int
+    entrystop: int
+    fileuuid: str
+    usermeta: Optional[dict] = field(default=None, compare=False)
+
+    def __len__(self) -> int:
+        return self.entrystop - self.entrystart
+
+
+
+
+class altRunner(Runner):
+    def __init__(self, *args, **kwargs):
+        print("start altRunner init")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        super().__init__(*args, **kwargs)
+        print("end altRunner init")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        
+    def preprocess(self, fileset, treename):
+        print("start preprocess")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        chunkGenerator = super().preprocess(fileset, treename)
+        print("end preprocess")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        return chunkGenerator
+
+    @staticmethod
+    def _work_function(
+        format: str,
+        xrootdtimeout: int,
+        mmap: bool,
+        schema: schemas.BaseSchema,
+        cache_function: Callable[[], MutableMapping],
+        use_dataframes: bool,
+        savemetrics: bool,
+        item: WorkItem,
+        processor_instance: ProcessorABC,
+    ) -> Dict:
+
+        print("start _work_function")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+
+        if processor_instance == "heavy":
+            item, processor_instance = item
+        if not isinstance(processor_instance, ProcessorABC):
+            processor_instance = cloudpickle.loads(lz4f.decompress(processor_instance))
+
+
+
+        if format == "root":
+
+
+            print("start uproot open")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+            print("item.filename:", item.filename)
+            filecontext = uproot.open(
+                {item.filename: None},
+                timeout=xrootdtimeout,
+                cache_size=100*1024*1024, # 100 MB cache
+                file_handler=uproot.MemmapSource
+                if mmap
+                else uproot.MultithreadedFileSource,
+            )
+
+            print("filecontext:", filecontext)
+            print("filecontext type:", type(filecontext))
+            print()
+
+
+        elif format == "parquet":
+            filecontext = ParquetFileContext(item.filename)
+
+
+        print("end uproot open")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        metadata = {
+            "dataset": item.dataset,
+            "filename": item.filename,
+            "treename": item.treename,
+            "entrystart": item.entrystart,
+            "entrystop": item.entrystop,
+            "fileuuid": str(uuid.UUID(bytes=item.fileuuid))
+            if len(item.fileuuid) > 0
+            else "",
+        }
+        if item.usermeta is not None:
+            metadata.update(item.usermeta)
+
+        with filecontext as file:
+            if schema is None:
+                # To deprecate
+                tree = None
+                if format == "root":
+                    tree = file[item.treename]
+                elif format == "parquet":
+                    tree = file
+                else:
+                    raise ValueError("Format can only be root or parquet!")
+                events = LazyDataFrame(
+                    tree, item.entrystart, item.entrystop, metadata=metadata
+                )
+            elif issubclass(schema, schemas.BaseSchema):
+                # change here
+                if format == "root":
+                    print("start from_root")
+                    print(f"=== THREADING DEBUG ===")
+                    print(f"Active threads: {threading.active_count()}")
+                    print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+                    print(f"Main thread: {threading.current_thread().name}")
+                    print(f"Current thread ID: {threading.get_ident()}")
+                    print(f"=======================")
+                    materialized = []
+                    factory = NanoEventsFactory.from_root(
+                        file=file,
+                        treepath=item.treename,
+                        entry_start=item.entrystart,
+                        entry_stop=item.entrystop,
+                        persistent_cache=cache_function(),
+                        schemaclass=schema,
+                        metadata=metadata,
+                        access_log=materialized,
+                    )
+                    events = factory.events()
+                    print("end from_root")
+                    print(f"=== THREADING DEBUG ===")
+                    print(f"Active threads: {threading.active_count()}")
+                    print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+                    print(f"Main thread: {threading.current_thread().name}")
+                    print(f"Current thread ID: {threading.get_ident()}")
+                    print(f"=======================")
+                elif format == "parquet":
+                    skyhook_options = {}
+                    if ":" in item.filename:
+                        (
+                            ceph_config_path,
+                            ceph_data_pool,
+                            filename,
+                        ) = item.filename.split(":")
+                        # patch back filename into item
+                        item = WorkItem(**dict(asdict(item), filename=filename))
+                        skyhook_options["ceph_config_path"] = ceph_config_path
+                        skyhook_options["ceph_data_pool"] = ceph_data_pool
+
+                    factory = NanoEventsFactory.from_parquet(
+                        file=item.filename,
+                        treepath=item.treename,
+                        schemaclass=schema,
+                        metadata=metadata,
+                        skyhook_options=skyhook_options,
+                    )
+                    events = factory.events()
+            else:
+                raise ValueError(
+                    "Expected schema to derive from nanoevents.BaseSchema, instead got %r"
+                    % schema
+                )
+            tic = time.time()
+            try:
+                print("start process in work function")
+                print(f"=== THREADING DEBUG ===")
+                print(f"Active threads: {threading.active_count()}")
+                print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+                print(f"Main thread: {threading.current_thread().name}")
+                print(f"Current thread ID: {threading.get_ident()}")
+                print(f"=======================")
+                out = processor_instance.process(events)
+                print("end process in work function")
+                print(f"=== THREADING DEBUG ===")
+                print(f"Active threads: {threading.active_count()}")
+                print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+                print(f"Main thread: {threading.current_thread().name}")
+                print(f"Current thread ID: {threading.get_ident()}")
+                print(f"=======================")
+            except Exception as e:
+                raise Exception(f"Failed processing file: {item!r}") from e
+            if out is None:
+                raise ValueError(
+                    "Output of process() should not be None. Make sure your processor's process() function returns an accumulator."
+                )
+            toc = time.time()
+            if use_dataframes:
+                return out
+            else:
+                if savemetrics:
+                    metrics = {}
+                    if isinstance(file, uproot.ReadOnlyDirectory):
+                        metrics["bytesread"] = file.file.source.num_requested_bytes
+                    if schema is not None and issubclass(schema, schemas.BaseSchema):
+                        metrics["columns"] = set(materialized)
+                        metrics["entries"] = len(events)
+                    else:
+                        metrics["columns"] = set(events.materialized)
+                        metrics["entries"] = events.size
+                    metrics["processtime"] = toc - tic
+                    return {"out": out, "metrics": metrics, "processed": set([item])}
+                return {"out": out, "processed": set([item])}
+        
+    def run(
+        self,
+        fileset: Union[Dict, str, List[WorkItem], Generator],
+        processor_instance: ProcessorABC,
+        treename: str = None,
+    ) -> Accumulatable:
+        """Run the processor_instance on a given fileset
+
+        Parameters
+        ----------
+            fileset : dict | str | List[WorkItem] | Generator
+                - A dictionary ``{dataset: [file, file], }``
+                  Optionally, if some files' tree name differ, the dictionary can be specified:
+                  ``{dataset: {'treename': 'name', 'files': [file, file]}, }``
+                - A single file name
+                - File chunks for self.preprocess()
+                - Chunk generator
+            treename : str, optional
+                name of tree inside each root file, can be ``None``;
+                treename can also be defined in fileset, which will override the passed treename
+                Not needed if processing premade chunks
+            processor_instance : ProcessorABC
+                An instance of a class deriving from ProcessorABC
+        """
+
+        meta = False
+        if not isinstance(fileset, (Mapping, str)):
+            if isinstance(fileset, Generator) or isinstance(fileset[0], WorkItem):
+                meta = True
+            else:
+                raise ValueError(
+                    "Expected fileset to be a mapping dataset: list(files) or filename"
+                )
+        if not isinstance(processor_instance, ProcessorABC):
+            raise ValueError("Expected processor_instance to derive from ProcessorABC")
+
+        if meta:
+            chunks = fileset
+        else:
+            chunks = self.preprocess(fileset, treename)
+
+
+        print("start lz4f compression")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        if self.processor_compression is None:
+            pi_to_send = processor_instance
+        else:
+            pi_to_send = lz4f.compress(
+                cloudpickle.dumps(processor_instance),
+                compression_level=self.processor_compression,
+            )
+
+        print("start closure")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        # hack around dask/dask#5503 which is really a silly request but here we are
+        if isinstance(self.executor, DaskExecutor):
+            self.executor.heavy_input = pi_to_send
+            closure = partial(
+                self._work_function,
+                self.format,
+                self.xrootdtimeout,
+                self.mmap,
+                self.schema,
+                partial(self.get_cache, self.cachestrategy),
+                self.use_dataframes,
+                self.savemetrics,
+                processor_instance="heavy",
+            )
+        else:
+            closure = partial(
+                self._work_function,
+                self.format,
+                self.xrootdtimeout,
+                self.mmap,
+                self.schema,
+                partial(self.get_cache, self.cachestrategy),
+                self.use_dataframes,
+                self.savemetrics,
+                processor_instance=pi_to_send,
+            )
+
+        if self.format == "root" and isinstance(
+            self.executor, (TaskVineExecutor, WorkQueueExecutor)
+        ):
+            # keep chunks in generator, use a copy to count number of events
+            # this is cheap, as we are reading from the cache
+            chunks_to_count = self.preprocess(fileset, treename)
+        else:
+            # materialize chunks to list, then count that list
+            chunks = list(chunks)
+            chunks_to_count = chunks
+
+        events_total = sum(len(c) for c in chunks_to_count)
+
+        exe_args = {
+            "unit": "chunk",
+            "function_name": type(processor_instance).__name__,
+        }
+        if isinstance(self.executor, (TaskVineExecutor, WorkQueueExecutor)):
+            exe_args.update(
+                {
+                    "unit": "event",
+                    "events_total": events_total,
+                    "dynamic_chunksize": self.dynamic_chunksize,
+                    "chunksize": self.chunksize,
+                }
+            )
+
+        print("start second closure")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        closure = partial(
+            self.automatic_retries, self.retries, self.skipbadfiles, closure
+        )
+
+
+        print("start executor copy")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        executor = self.executor.copy(**exe_args)
+
+        print("start executor run")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        print("executor type:", type(executor))
+        wrapped_out, e = executor(chunks, closure, None)
+
+        print("end executor run")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        if wrapped_out is None:
+            raise ValueError(
+                "No chunks returned results, verify ``processor`` instance structure.\n\
+                if you used skipbadfiles=True, it is possible all your files are bad."
+            )
+        wrapped_out["exception"] = e
+
+        if not self.use_dataframes:
+            processor_instance.postprocess(wrapped_out["out"])
+
+        if "metrics" in wrapped_out.keys():
+            if isinstance(self.executor, (TaskVineExecutor, WorkQueueExecutor)):
+                wrapped_out["metrics"]["chunks"] = len(wrapped_out["processed"])
+            else:
+                wrapped_out["metrics"]["chunks"] = len(chunks_to_count)
+
+            for k, v in wrapped_out["metrics"].items():
+                if isinstance(v, set):
+                    wrapped_out["metrics"][k] = list(v)
+        if self.use_dataframes:
+            return wrapped_out["out"]
+        else:
+            return wrapped_out
+
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.option('--cfg', required=True, type=str,
@@ -215,6 +669,15 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         
     # Instantiate the executor
     
+    print("before executor creation")
+
+    print(f"=== THREADING DEBUG ===")
+    print(f"Active threads: {threading.active_count()}")
+    print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+    print(f"Main thread: {threading.current_thread().name}")
+    print(f"Current thread ID: {threading.get_ident()}")
+    print(f"=======================")
+
     # Checking if the executor handles the submission or returns a coffea executor
     if executor_factory.handles_submission:
         # in this case we just send to the executor the config file
@@ -223,6 +686,13 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     else:
         executor = executor_factory.get()
 
+    print("after executor creation")
+    print(f"=== THREADING DEBUG ===")
+    print(f"Active threads: {threading.active_count()}")
+    print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+    print(f"Main thread: {threading.current_thread().name}")
+    print(f"Current thread ID: {threading.get_ident()}")
+    print(f"=======================")
 
     start_time = time.time()
         
@@ -243,7 +713,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
             maxchunks=run_options["limit-chunks"],
             skipbadfiles=run_options['skip-bad-files'],
             schema=processor.NanoAODSchema,
-            format="root",
+            format="root"
         )
         output = run(filesets_to_run, treename="Events",
                      processor_instance=config.processor_instance)
@@ -277,6 +747,9 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
 
         # Running separately on each dataset
         for group_name, fileset_ in filesets_groups.items():
+            print("Testing:", group_name)
+            if("_2J_" not in group_name or "100to" not in group_name):
+                continue
             dataset_start_time = time.time()
             datasets = list(fileset_.keys())
             if len(datasets) == 1:
@@ -294,16 +767,48 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
             if adapted_chunksize != run_options["chunksize"]:
                 logging.info(f"Reducing chunksize from {run_options['chunksize']} to {adapted_chunksize} for dataset(s) {group_name}")
 
-            run = Runner(
+
+            print("before runner creation")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+
+            print("Executor type:", type(executor))
+
+            run = altRunner(
                 executor=executor,
                 chunksize=adapted_chunksize,
                 maxchunks=run_options["limit-chunks"],
                 skipbadfiles=run_options['skip-bad-files'],
                 schema=processor.NanoAODSchema,
                 format="root",
+                mmap=True
             )
+
+            print("runner type:", type(run))
+            print("run.mmap:", run.mmap)
+
+            print("after runner creation")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
             output = run(fileset_, treename="Events",
                          processor_instance=config.processor_instance)
+
+            print("after runner execution")
+            print(f"=== THREADING DEBUG ===")
+            print(f"Active threads: {threading.active_count()}")
+            print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+            print(f"Main thread: {threading.current_thread().name}")
+            print(f"Current thread ID: {threading.get_ident()}")
+            print(f"=======================")
+                         
             print(f"Saving output to {outfile.format(group_name)}")
             save(output, outfile.format(group_name))
             print_processing_stats(output, dataset_start_time, run_options["scaleout"])

@@ -6,6 +6,9 @@ from abc import ABC, abstractmethod
 import cachetools
 from copy import deepcopy
 
+import threading
+import psutil
+import os
 import copy
 import os
 import logging
@@ -22,6 +25,7 @@ from ..lib.leptons import get_ele_smeared, get_ele_scaled
 from ..lib.categorization import CartesianSelection
 from ..utils.skim import uproot_writeable, copy_file
 from ..utils.utils import dump_ak_array
+from ..lib.delayed_eval import DelayedEvalBranchManager
 
 from ..utils.configurator import Configurator
 
@@ -40,6 +44,15 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
         :param cfg: Configurator object containing all the configurations.
         '''
+
+        print("start processor creation")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
         # Saving the configurator object in the processor
         self.cfg = cfg
         self.workflow_options = self.cfg.workflow_options
@@ -69,6 +82,9 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # Custom axis for the histograms
         self.custom_axes = []
         self.custom_histogram_fields = {}
+
+        # Lazy independent branches manager (optional use by workflows)
+        self.delayed_branches = DelayedEvalBranchManager(self)
 
         # Output format
         # Accumulators for the output
@@ -100,6 +116,14 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             },
             "datasets_metadata":{ } #year:sample:subsample
         }
+
+        print("after processor creation")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
 
 
     @property
@@ -156,6 +180,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         Alternatively, if you need to apply the cut on preselected objects -
         define the cut at the preselection level, not at skim level.
         '''
+        print("start skim_events")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
         self._skim_masks = PackedSelection()
 
         for skim_func in self._skim:
@@ -174,6 +205,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self.nEvents_after_skim = self.nevents
         self.output['cutflow']['skim'][self._dataset] = self.nEvents_after_skim
         self.has_events = self.nEvents_after_skim > 0
+        print("end skim_events")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
 
     def export_skimmed_chunk(self):
         ''' Function that export the skimmed chunk to a new ROOT file.
@@ -239,6 +277,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         and filter out the events to speed up the later computations.
         N.B.: Preselection happens after the objects correction and cleaning.'''
 
+        print("start apply_preselections")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
         # The preselection mask is applied after the objects have been corrected
         self._preselection_masks = PackedSelection()
 
@@ -260,6 +305,14 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         if variation == "nominal":
             self.output['cutflow']['presel'][self._dataset] = self.nEvents_after_presel
         self.has_events = self.nEvents_after_presel > 0
+
+        print("end apply_preselections")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
 
     def define_categories(self, variation):
         '''
@@ -835,6 +888,93 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                     )
                     yield variation + shift
 
+
+    def initialLoading(self, events):
+        print("Type of events:", type(events))
+        self.events = events
+        print("Type of self.events:", type(self.events))
+        # Define the accumulator instance for this chunk
+        self.output = copy.deepcopy(self.output_format)
+
+        ###################
+        # At the beginning of the processing the initial number of events
+        # and the sum of the genweights is stored for later use
+        #################
+        print("start load_metadata")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+        self.load_metadata()
+        self.load_metadata_extra()
+        print("end load_metadata")
+
+        self.nEvents_initial = self.nevents
+        self.output['cutflow']['initial'][self._dataset] = self.nEvents_initial
+        if self._isMC:
+            # This is computed before any preselection
+            if not self._isSkim:
+                self.output['sum_genweights'][self._dataset] = ak.sum(self.events.genWeight)
+            else:
+                # If the dataset is a skim, the sumgenweights are rescaled
+                self.output['sum_genweights'][self._dataset] = ak.sum(self.events.skimRescaleGenWeight * self.events.genWeight)
+            #FIXME: handle correctly the skim for the sum_signOf_genweights
+            self.output['sum_signOf_genweights'][self._dataset] = ak.sum(np.sign(self.events.genWeight))
+                
+
+    def runVariations(self):
+        for variation in self.get_shape_variations():
+            # Apply preselections
+            self.apply_object_preselection(variation)
+            self.count_objects(variation)
+            # Compute variables after object preselection
+            self.define_common_variables_before_presel(variation)
+            # Customization point for derived workflows after preselection cuts
+            self.process_extra_before_presel(variation)
+
+            # Prepare lazy independent branches snapshot on nominal before preselections filter out events
+            if variation == "nominal":
+                self.delayed_branches.prepare_nominal_snapshot(self.events)
+
+            # This will remove all the events not passing preselection
+            # from further processing
+            self.apply_preselections(variation)
+
+            # If not events remains after the preselection we skip the chunk
+            if not self.has_events:
+                continue
+
+            ##########################
+            # After the preselection cuts has been applied more processing is performend
+            ##########################
+            # Customization point for derived workflows after preselection cuts
+            self.define_common_variables_after_presel(variation)
+            self.process_extra_after_presel(variation)
+
+            # This function applies all the cut functions in the cfg file
+            # Each category is an AND of some cuts.
+            self.define_categories(variation)
+
+            # Update lazy independent branches for this variation after final categories are defined
+            # so they see the final selection masks
+            self.delayed_branches.update_for_current_variation(self.events, self._categories)
+
+            # Weights
+            self.compute_weights(variation)
+            self.compute_weights_extra(variation)
+
+            # Fill histograms
+            self.fill_histograms(variation)
+            self.fill_histograms_extra(variation)
+            self.fill_column_accumulators(variation)
+            self.fill_column_accumulators_extra(variation)
+
+            # Count events
+            if variation == "nominal":
+                self.count_events(variation)
+
     def process(self, events: ak.Array):
         '''
         This function get called by Coffea on each chunk of NanoAOD file.
@@ -858,30 +998,18 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
           - define histograms
           - count events in each category
         '''
+        print("start process")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
+
+        self.initialLoading(events)
+
         self.start_time = time.time()
-        self.events = events
-        # Define the accumulator instance for this chunk
-        self.output = copy.deepcopy(self.output_format)
-
-        ###################
-        # At the beginning of the processing the initial number of events
-        # and the sum of the genweights is stored for later use
-        #################
-        self.load_metadata()
-        self.load_metadata_extra()
-
-        self.nEvents_initial = self.nevents
-        self.output['cutflow']['initial'][self._dataset] = self.nEvents_initial
-        if self._isMC:
-            # This is computed before any preselection
-            if not self._isSkim:
-                self.output['sum_genweights'][self._dataset] = ak.sum(self.events.genWeight)
-            else:
-                # If the dataset is a skim, the sumgenweights are rescaled
-                self.output['sum_genweights'][self._dataset] = ak.sum(self.events.skimRescaleGenWeight * self.events.genWeight)
-            #FIXME: handle correctly the skim for the sum_signOf_genweights
-            self.output['sum_signOf_genweights'][self._dataset] = ak.sum(np.sign(self.events.genWeight))
-                
+        
         ########################
         # Then the first skimming happens.
         # Events that are for sure useless are removed.
@@ -890,9 +1018,24 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # selections MUST be loose and inclusive w.r.t the final selections.
         #########################
         # Customization point for derived workflows before skimming
+        print("start process_extra_before_skim")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
         self.process_extra_before_skim()
         # MET filter, lumimask, + custom skimming function
+        print("start skim_events")
+        print(f"=== THREADING DEBUG ===")
+        print(f"Active threads: {threading.active_count()}")
+        print(f"Thread names: {[t.name for t in threading.enumerate()]}")
+        print(f"Main thread: {threading.current_thread().name}")
+        print(f"Current thread ID: {threading.get_ident()}")
+        print(f"=======================")
         self.skim_events()
+        print("end skim_events")
         if not self.has_events:
             return self.output
 
@@ -915,47 +1058,10 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self.define_column_accumulators()
         self.define_column_accumulators_extra()
 
-        for variation in self.get_shape_variations():
-            # Apply preselections
-            self.apply_object_preselection(variation)
-            self.count_objects(variation)
-            # Compute variables after object preselection
-            self.define_common_variables_before_presel(variation)
-            # Customization point for derived workflows after preselection cuts
-            self.process_extra_before_presel(variation)
 
-            # This will remove all the events not passing preselection
-            # from further processing
-            self.apply_preselections(variation)
+        self.runVariations()
 
-            # If not events remains after the preselection we skip the chunk
-            if not self.has_events:
-                continue
-
-            ##########################
-            # After the preselection cuts has been applied more processing is performend
-            ##########################
-            # Customization point for derived workflows after preselection cuts
-            self.define_common_variables_after_presel(variation)
-            self.process_extra_after_presel(variation)
-
-            # This function applies all the cut functions in the cfg file
-            # Each category is an AND of some cuts.
-            self.define_categories(variation)
-
-            # Weights
-            self.compute_weights(variation)
-            self.compute_weights_extra(variation)
-
-            # Fill histograms
-            self.fill_histograms(variation)
-            self.fill_histograms_extra(variation)
-            self.fill_column_accumulators(variation)
-            self.fill_column_accumulators_extra(variation)
-
-            # Count events
-            if variation == "nominal":
-                self.count_events(variation)
+        
 
         self.stop_time = time.time()
         self.save_processing_metadata()
