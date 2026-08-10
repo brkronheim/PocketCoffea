@@ -1,6 +1,5 @@
 from collections import defaultdict
 from typing import List
-import copy
 
 import awkward as ak
 
@@ -124,8 +123,8 @@ class CalibratorsManager():
                     if col not in self.original_coll:     
                         try:
                             # If the collection is not in the original collection, we store it
-                            self.original_coll[col] = copy.copy(events[col])  # store soft link
-                        except ValueError:
+                            self.original_coll[col] = events[col]  # store soft link (awkward arrays are immutable)
+                        except (ValueError, ak.errors.FieldNotFoundError):
                             # This means that the column is not present in the events and it is created by the calibrator
                             # and it is not a problem
                             pass
@@ -136,7 +135,7 @@ class CalibratorsManager():
                     collection, field = col.split(".")
                     if col not in self.original_coll:
                         try:
-                            self.original_coll[col] = copy.copy(events[collection, field]) 
+                            self.original_coll[col] = events[collection, field] 
                         except ak.errors.FieldNotFoundError:
                             # This means that the column is not present in the events and it is created by the calibrator
                             # and it is not a problem

@@ -158,6 +158,42 @@ condor@rubin:
   max-run-time: 21600
   max-retries: 1
 
+condor@cmsconnect:
+  cores-per-worker: 1
+  mem-per-worker: "4GB"
+  disk-per-worker: "4GB"
+  worker-image: /cvmfs/unpacked.cern.ch/gitlab-registry.cern.ch/batch-team/containers/plusbatch/el9:latest
+  queue: null
+  custom-setup-commands: null
+  max-retries: 3
+  eos-prefix: root://eosuser.cern.ch/
+  ship-python-env: true
+  python-env-path: null
+  python-env-archive: null
+  python-env-cache: true
+  python-env-cache-dir: null
+  python-env-force-repack: false
+  python-env-exclude-packages:
+    - cupy
+    - cupy_backends
+    - jaxlib
+    - nvidia
+    - tensorflow
+    - tensorrt
+    - triton
+  analysis-transfer-paths:
+    - "*.py"
+    - workflow
+    - scripts
+    - params
+    - MVA
+  staging-area: null
+  output-destination: null
+  status-destination: null
+  convert-parquet-to-root: false
+  parquet-output-dir: columns
+  keep-coffea-output: true
+
 dask@purdue-af:
   gateway-address: "http://dask-gateway-k8s.geddes.rcac.purdue.edu/"
   gateway-proxy-address: "traefik-dask-gateway-k8s.cms.geddes.rcac.purdue.edu:8786"

@@ -39,7 +39,7 @@ Changelog = "https://github.com/PocketCoffea/PocketCoffea/releases"
 [tool.setuptools.dynamic]
 version = {attr = "pocket_coffea.__meta__.__version__"}
 readme = {file = ["README.md"], content-type = "text/markdown"}
-dependencies = {file = ["requirements.txt"]}
+dependencies = {file = ["requirements-cpu.txt"]}
 
 
 [project.optional-dependencies]
@@ -77,6 +77,7 @@ print-parameters="pocket_coffea.scripts.print_parameters:print_parameters"
 make-config="pocket_coffea.scripts.make_config:make_config"
 check-jobs="pocket_coffea.scripts.check_jobs:check_jobs"
 inspect-job="pocket_coffea.scripts.inspect_job:inspect_job"
+parquet-to-root="pocket_coffea.scripts.parquet_to_root:main"
 
 # [tool.flake8]
 # extend-ignore = ["E203", "E501", "E722", "B950"]

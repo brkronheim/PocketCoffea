@@ -2,10 +2,10 @@ from contextlib import contextmanager
 import importlib.util
 import os
 import sys
+import time
 from typing import List, Optional
 import awkward
 import pathlib
-import shutil
 from .configurator import Configurator
 import hashlib
 from numba import njit
@@ -75,14 +75,22 @@ def path_import(absolute_path):
     
 def load_config(cfg, do_load=True, save_config=True, outputdir=None):
     ''' Helper function to load a Configurator instance from a user defined python module'''
+    print(f"[TIMING] Starting path_import for config: {cfg}")
+    _t0 = time.time()
     config_module =  path_import(cfg)
+    print(f"[TIMING] path_import: {time.time()-_t0:.2f}s")
     try:
         config = config_module.cfg
         # Load the configuration
         if do_load:
+            print(f"[TIMING] Starting Configurator.load()...")
+            _t1 = time.time()
             config.load()
+            print(f"[TIMING] Configurator.load(): {time.time()-_t1:.2f}s")
         if save_config and outputdir is not None:
+            _t2 = time.time()
             config.save_config(outputdir)
+            print(f"[TIMING] save_config: {time.time()-_t2:.2f}s")
     except AttributeError as e:
         print("Error: ", e)
         raise Exception("The provided configuration module does not contain a `cfg` attribute of type Configurator. Please check your configuration!")
@@ -109,10 +117,12 @@ def dump_ak_array(
     fname: str,
     location: str,
     subdirs: Optional[List[str]] = None,
-) -> None:
+) -> dict:
     """
     Dump an awkward array to disk at location/'/'.join(subdirs)/fname.
     """
+    timing = {}
+    start = time.time()
     subdirs = subdirs or []
     xrd_prefix = "root://"
     pfx_len = len(xrd_prefix)
@@ -127,33 +137,112 @@ def dump_ak_array(
             raise ImportError(
                 "Install XRootD python bindings with: conda install -c conda-forge xroot"
             ) from err
-    local_file = (
-        os.path.abspath(os.path.join(".", fname))
-        if xrootd
-        else os.path.join(".", fname)
-    )
     merged_subdirs = "/".join(subdirs) if xrootd else os.path.sep.join(subdirs)
     destination = (
         location + merged_subdirs + f"/{fname}"
         if xrootd
         else os.path.join(location, os.path.join(merged_subdirs, fname))
     )
+    if xrootd:
+        local_file = os.path.abspath(os.path.join(".", fname))
+    else:
+        dirname = os.path.dirname(destination)
+        pathlib.Path(dirname).mkdir(parents=True, exist_ok=True)
+        local_file = destination
+    _t0 = time.time()
     awkward.to_parquet(akarr, local_file, parquet_compliant_nested=True)
+    timing["to_parquet"] = time.time() - _t0
     if xrootd: # fix XRootD mkdir offen meet problem like: Exception: [ERROR] Server responded with an error: [3018] Unable to mkdir ...（your dir）..; File exists
+        _t0 = time.time()
         copyproc = XRootD.client.CopyProcess()
         #old: copyproc.add_job(local_file, destination, force=True)
         copyproc.add_job(local_file, destination, mkdir=True, force=True) 
         copyproc.prepare()
         status, response = copyproc.run()
+        timing["copy"] = time.time() - _t0
         if status.status != 0:
             raise Exception(status.message)
         del copyproc
     else:
+        assert os.path.isfile(destination)
+        timing["copy"] = 0.0
+    if xrootd:
+        pathlib.Path(local_file).unlink()
+    timing["total"] = time.time() - start
+    timing["destination"] = destination
+    return timing
+
+
+def dump_ak_arrays_to_root(
+    arrays_by_tree: dict,
+    fname: str,
+    location: str,
+    subdirs: Optional[List[str]] = None,
+) -> dict:
+    """
+    Dump awkward arrays to one ROOT file at location/'/'.join(subdirs)/fname.
+
+    Each key in arrays_by_tree becomes a separate TTree, allowing categories
+    with different row counts to be written in one file and copied once.
+    """
+    import uproot
+
+    timing = {}
+    start = time.time()
+    subdirs = subdirs or []
+    xrootd = "root://" in location
+    if xrootd:
+        try:
+            import XRootD  # type: ignore
+            import XRootD.client  # type: ignore
+        except ImportError as err:
+            raise ImportError(
+                "Install XRootD python bindings with: conda install -c conda-forge xroot"
+            ) from err
+
+    merged_subdirs = "/".join(subdirs) if xrootd else os.path.sep.join(subdirs)
+    destination = (
+        location + merged_subdirs + f"/{fname}"
+        if xrootd
+        else os.path.join(location, os.path.join(merged_subdirs, fname))
+    )
+    if xrootd:
+        local_file = os.path.abspath(os.path.join(".", fname))
+    else:
         dirname = os.path.dirname(destination)
         pathlib.Path(dirname).mkdir(parents=True, exist_ok=True)
-        shutil.copy(local_file, destination)
+        local_file = destination
+
+    _t0 = time.time()
+    trees_written = 0
+    with uproot.recreate(local_file) as root_file:
+        for tree_name, akarr in arrays_by_tree.items():
+            fields = awkward.fields(akarr)
+            if len(akarr) == 0 or not fields:
+                continue
+            root_file[tree_name] = {field: akarr[field] for field in fields}
+            trees_written += 1
+    timing["root_write"] = time.time() - _t0
+
+    if xrootd:
+        _t0 = time.time()
+        copyproc = XRootD.client.CopyProcess()
+        copyproc.add_job(local_file, destination, mkdir=True, force=True)
+        copyproc.prepare()
+        status, response = copyproc.run()
+        timing["copy"] = time.time() - _t0
+        if status.status != 0:
+            raise Exception(status.message)
+        del copyproc
+        pathlib.Path(local_file).unlink()
+    else:
         assert os.path.isfile(destination)
-    pathlib.Path(local_file).unlink()
+        timing["copy"] = 0.0
+
+    timing["total"] = time.time() - start
+    timing["destination"] = destination
+    timing["trees_written"] = trees_written
+    return timing
 
 
 def get_nano_version(events, params, year):

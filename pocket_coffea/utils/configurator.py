@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import time
 from copy import deepcopy
 from pprint import pprint, pformat
 import cloudpickle
@@ -149,10 +150,16 @@ class Configurator:
     def load(self):
         '''This function loads the configuration for samples/weights/variations and creates
         the necessary objects for the processor to use. It also loads the workflow'''
+        print("[TIMING] Configurator.load() - start")
+        _t_load = time.time()
+        _t0 = time.time()
         if not self.filesets_loaded:
             # Avoid reloading the datasets if the configurator already loaded them manually.
             # This happens when the configurator is manipulated to restrict the fileset before pickling (condor submission)
             self.load_datasets()
+            print(f"[TIMING]   load_datasets: {time.time()-_t0:.2f}s")
+        else:
+            print("[TIMING]   load_datasets: skipped (filesets already loaded)")
 
         # Now loading and storing the metadata of the filtered filesets
         if len(self.filesets) == 0:
@@ -180,14 +187,18 @@ class Configurator:
                     "isMC": m["isMC"] =="True",
                 }
             
+        _t0 = time.time()
         self.load_subsamples()
+        print(f"[TIMING]   load_subsamples: {time.time()-_t0:.2f}s")
 
         # Categories: object handling categorization
         # - StandardSelection
         # - CartesianSelection
         ## Call the function which transforms the dictionary in the cfg
         # in the objects needed in the processors
+        _t0 = time.time()
         self.load_cuts_and_categories(self.skim_cfg, self.preselections_cfg, self.categories_cfg)
+        print(f"[TIMING]   load_cuts_and_categories: {time.time()-_t0:.2f}s")
 
         self.weights_config = {
             s: {
@@ -222,7 +233,9 @@ class Configurator:
         for w in self.weights_classes:
             self.available_weights[w.name] = w
          
+        _t0 = time.time()
         self.load_weights_config(self.weights_cfg)
+        print(f"[TIMING]   load_weights_config: {time.time()-_t0:.2f}s")
         # keeping a unique list of requested weight to load
         self.requested_weights = list(set(self.requested_weights))
         self.weights_classes = list(filter(lambda x: x.name in self.requested_weights, self.weights_classes))
@@ -262,8 +275,12 @@ class Configurator:
         if "shape" not in self.variations_cfg:
             self.variations_cfg["shape"] = {"common": {"inclusive": []}}
 
+        _t0 = time.time()
         self.load_variations_config(self.variations_cfg["weights"], variation_type="weights")
+        print(f"[TIMING]   load_variations_config (weights): {time.time()-_t0:.2f}s")
+        _t0 = time.time()
         self.load_variations_config(self.variations_cfg["shape"], variation_type="shape")
+        print(f"[TIMING]   load_variations_config (shape): {time.time()-_t0:.2f}s")
             
         # Collecting overall list of available weights and shape variations per sample
         self.available_weights_variations = {s: ["nominal"] for s in self.samples}
@@ -293,22 +310,31 @@ class Configurator:
             ) 
             
         # Columns configuration
+        _t0 = time.time()
         self.load_columns_config(self.columns_cfg)
+        print(f"[TIMING]   load_columns_config: {time.time()-_t0:.2f}s")
 
+        _t0 = time.time()
         self.perform_checks()
+        print(f"[TIMING]   perform_checks: {time.time()-_t0:.2f}s")
         
         # Check if the jet calibration is legacy or not, and build the
         # calibrator factory file if not present
         if self.parameters.jets_calibration.get("legacy_txt_calibration", False):
             print("Using legacy txt jet calibration, factory building needed. Please switch to the new correctionlib calibration if possible.")
+            _t0 = time.time()
             if not os.path.exists(self.parameters.jets_calibration.factory_file):
                 build_jets_calibrator.build(self.parameters.jets_calibration)
+            print(f"[TIMING]   jet calibration factory: {time.time()-_t0:.2f}s")
             
         # Load the workflow as the last thing
+        _t0 = time.time()
         self.load_workflow()
+        print(f"[TIMING]   load_workflow: {time.time()-_t0:.2f}s")
 
         # Mark the configurator as loaded
         self.loaded = True
+        print(f"[TIMING] Configurator.load() - total: {time.time()-_t_load:.2f}s")
 
     def load_datasets(self):
         for json_dataset in self.datasets_cfg["jsons"]:

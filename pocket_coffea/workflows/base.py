@@ -20,7 +20,7 @@ from ..lib.hist_manager import HistManager
 from ..lib.jets import load_jet_factory
 from ..lib.calibrators.calibrators_manager import CalibratorsManager
 from ..utils.skim import uproot_writeable, copy_file, apply_skim_sumgenweights_override
-from ..utils.utils import dump_ak_array
+from ..utils.utils import dump_ak_arrays_to_root
 from ..lib.delayed_eval import DelayedEvalBranchManager
 
 from ..utils.configurator import Configurator
@@ -375,7 +375,6 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         The current shape variation is passed to be used for the weights
         calculation.
         '''
-        # Compute the weights
         self.weights_manager.compute(self.events,
                                      size=self.nEvents_after_presel,
                                      shape_variation=variation)
@@ -473,6 +472,8 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         '''
         # Filling the autofill=True histogram automatically
         # Calling hist manager with the subsample masks
+        
+
         self.hists_manager.fill_histograms(
             self.events,
             self._categories,
@@ -480,6 +481,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             shape_variation=variation,
             custom_fields=self.custom_histogram_fields,
         )
+
         # Saving the output for each sample/subsample
         for subs in self._subsamples[self._sample].keys():
             # When we loop on all the subsample we need to format correctly the output if
@@ -524,16 +526,77 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         processor, if they cannot be defined from the configuration
         '''
 
+    def _is_dumping_columns_to_root(self):
+        return self.workflow_options is not None and self.workflow_options.get("dump_columns_as_arrays_per_chunk", None) is not None
+
+    def _prepare_column_root_dump(self):
+        self._column_root_arrays = {}
+        self._column_root_skipped_empty = 0
+        self._column_root_build_time = 0.0
+        self._column_root_dump_location = None
+        self._column_root_fname = None
+
+    def _queue_column_root_arrays(self, out_arrays, variation, subs=None):
+        if self._column_root_dump_location is None:
+            self._column_root_dump_location = self.workflow_options["dump_columns_as_arrays_per_chunk"] + "/"
+        if self._column_root_fname is None:
+            fname_base = self.events.attrs["@events_factory"]._partition_key.replace("/", "_")
+            self._column_root_fname = fname_base + ".root"
+
+        written = 0
+        skipped_empty = 0
+        for category, akarr in out_arrays.items():
+            if len(akarr) == 0:
+                skipped_empty += 1
+                continue
+            tree_path = f"{variation}/{subs}/{category}" if subs is not None else f"{variation}/{category}"
+            self._column_root_arrays[tree_path] = akarr
+            written += 1
+            if subs is not None:
+                print(f"[TIMING]         columns category={category}, subs={subs}, rows={len(akarr)}")
+            else:
+                print(f"[TIMING]         columns category={category}, rows={len(akarr)}")
+
+        self._column_root_skipped_empty += skipped_empty
+        return written, skipped_empty
+
+    def flush_column_accumulators_to_root(self):
+        if not self._is_dumping_columns_to_root() or len(self.column_managers) == 0:
+            return
+        if not getattr(self, "_column_root_arrays", None):
+            print(
+                f"[TIMING]     columns ROOT chunk dump: no non-empty categories, "
+                f"skipped_empty={getattr(self, '_column_root_skipped_empty', 0)}"
+            )
+            return
+
+        _t0 = time.time()
+        _dump_timing = dump_ak_arrays_to_root(
+            self._column_root_arrays,
+            self._column_root_fname,
+            self._column_root_dump_location,
+            [self._dataset],
+        )
+        print(
+            f"[TIMING]     columns ROOT chunk dump: build={self._column_root_build_time:.3f}s, "
+            f"write={_dump_timing.get('total', 0.0):.3f}s "
+            f"(root_write={_dump_timing.get('root_write', 0.0):.3f}s, copy={_dump_timing.get('copy', 0.0):.3f}s), "
+            f"written_trees={_dump_timing.get('trees_written', 0)}, skipped_empty={self._column_root_skipped_empty}, "
+            f"total={time.time()-_t0+self._column_root_build_time:.3f}s"
+        )
+
     def fill_column_accumulators(self, variation):
         """Fill columns for a given variation either on disk as `parquet` file or in the output `coffea` file. Different variations are stored as subfolders of categories."""
         if len(self.column_managers) == 0:
             return
 
+        _columns_total_start = time.time()
         outcols = self.output["columns"]
         if self._hasSubsamples:
             # call the filling for each
             for subs in self._subsamples[self._sample].keys():
-                if self.workflow_options is not None and self.workflow_options.get("dump_columns_as_arrays_per_chunk", None) is not None:
+                if self._is_dumping_columns_to_root():
+                    _columns_total_start = time.time()
                     # filling awkward arrays to be dumped per chunk
                     if self.column_managers[subs].ncols == 0:
                         break
@@ -544,12 +607,14 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                                                subsample_mask=self._subsamples[self._sample].get_mask(subs),
                                                weights_manager=self.weights_manager
                                                )
-                    fname = (self.events.attrs["@events_factory"]._partition_key.replace( "/", "_" )
-                        + ".parquet")
-                    for category, akarr in out_arrays.items():
-                        # building the file name
-                        subdirs = [self._dataset, subs, category, variation]
-                        dump_ak_array(akarr, fname, self.workflow_options["dump_columns_as_arrays_per_chunk"] + "/", subdirs)
+                    _build_time = time.time() - _columns_total_start
+                    self._column_root_build_time += _build_time
+                    _written, _skipped_empty = self._queue_column_root_arrays(out_arrays, variation, subs=subs)
+                    print(
+                        f"[TIMING]       columns ROOT queue subs={subs}: build={_build_time:.3f}s, "
+                        f"queued_categories={_written}, skipped_empty={_skipped_empty}, "
+                        f"total={time.time()-_columns_total_start:.3f}s"
+                    )
 
                 else:
                     # Filling columns to be accumulated for all the chunks
@@ -569,7 +634,8 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             # NO subsamples
             if self.column_managers[self._sample].ncols == 0:
                 return
-            if self.workflow_options is not None and self.workflow_options.get("dump_columns_as_arrays_per_chunk", None) is not None:
+            if self._is_dumping_columns_to_root():
+                _t0 = time.time()
                 out_arrays = self.column_managers[self._sample].fill_ak_arrays(
                                                self.events,
                                                self._categories,
@@ -577,12 +643,14 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                                                subsample_mask=None,
                                                weights_manager=self.weights_manager
                                                )
-                # building the file name
-                fname = (self.events.attrs["@events_factory"]._partition_key.replace( "/", "_" )
-                         + ".parquet")
-                for category, akarr in out_arrays.items():
-                    subdirs = [self._dataset, category, variation]
-                    dump_ak_array(akarr, fname, self.workflow_options["dump_columns_as_arrays_per_chunk"] + "/", subdirs)
+                _build_time = time.time() - _t0
+                self._column_root_build_time += _build_time
+                _written, _skipped_empty = self._queue_column_root_arrays(out_arrays, variation)
+                print(
+                    f"[TIMING]       columns ROOT queue: build={_build_time:.3f}s, "
+                    f"queued_categories={_written}, skipped_empty={_skipped_empty}, "
+                    f"total={time.time()-_columns_total_start:.3f}s"
+                )
             else:
                 outcols[self._sample] = {self._dataset: self.column_managers[
                     self._sample
@@ -682,7 +750,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 self._metadata,
                 requested_calibrator_variations=self.cfg.available_shape_variations[self._sample],
             )
-
+  
     def _announce_skim_mode(self, skim_mode):
         '''One-time-per-dataset banner describing the skim mode in effect.
 
@@ -728,6 +796,8 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
     def loop_over_variations(self):
         # Get the requested shape variations by calibrator
+        _t_loop = None
+        n_vars = 0
         for variation, events_calibrated in self.calibrators_manager.calibration_loop(
             self.events,
             # Running only the shape variations activated in the configuration
@@ -736,6 +806,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             variations_for_calibrators=self.cfg.available_shape_variations[self._sample],
             debug=self.workflow_options.get("debug_calibrators", False),
         ):
+            n_vars += 1
             # We need to set the events to the calibrated ones
             # and call the function to apply the preselection
             # print("workflow/base.py: processing the variation - ", variation)
@@ -767,17 +838,24 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
           - define histograms
           - count events in each category
         '''
+        _chunk_start = time.time()
         self.start_time = time.time()
         self.events = events
         # Define the accumulator instance for this chunk
         self.output = copy.deepcopy(self.output_format)
+        self._prepare_column_root_dump()
+
+        ds_name = events.metadata.get("dataset", "unknown") if hasattr(events, 'metadata') else "unknown"
+        print(f"[TIMING]   [Chunk begin] dataset={ds_name}, nevents_initial={len(events)}")
 
         ###################
         # At the beginning of the processing the initial number of events
         # and the sum of the genweights is stored for later use
         #################
+        _t0 = time.time()
         self.load_metadata()
         self.load_metadata_extra()
+        print(f"[TIMING]     load_metadata: {time.time()-_t0:.3f}s")
 
         self.nEvents_initial = self.nevents
         self.output['cutflow']['initial'][self._dataset] = self.nEvents_initial
@@ -799,10 +877,15 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # selections MUST be loose and inclusive w.r.t the final selections.
         #########################
         # Customization point for derived workflows before skimming
+        _t0 = time.time()
         self.process_extra_before_skim()
+        print(f"[TIMING]     process_extra_before_skim: {time.time()-_t0:.3f}s")
         # MET filter, lumimask, + custom skimming function
+        _t0 = time.time()
         self.skim_events()
+        print(f"[TIMING]     skim_events: {time.time()-_t0:.3f}s (events after skim: {self.nEvents_after_skim if hasattr(self, 'nEvents_after_skim') else 'N/A'})")
         if not self.has_events:
+            print(f"[TIMING]   [Chunk end] No events after skim, returning early. Total chunk time: {time.time()-_chunk_start:.3f}s")
             return self.output
 
         skim_mode = self.workflow_options.get("skim_mode", "skim") if self.workflow_options else "skim"
@@ -814,6 +897,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 f"(skim cuts on raw NanoAOD, no calibration / no preselection)."
             )
             self.export_skimmed_chunk()
+            print(f"[TIMING]   [Chunk end] Exported skimmed chunk. Total chunk time: {time.time()-_chunk_start:.3f}s")
             return self.output
 
         # --- Systematic-aware skimming logic
@@ -863,32 +947,61 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # Doing so we avoid to compute them on the full NanoAOD dataset
         #########################
 
+        _t0 = time.time()
         self.process_extra_after_skim()
+        print(f"[TIMING]     process_extra_after_skim: {time.time()-_t0:.3f}s")
         # Define and load the calibators
+        _t0 = time.time()
         self.initialize_calibrators()
+        print(f"[TIMING]     initialize_calibrators: {time.time()-_t0:.3f}s")
         # Define and load the weights manager
+        _t0 = time.time()
         self.define_weights()
+        print(f"[TIMING]     define_weights: {time.time()-_t0:.3f}s")
         # Create the HistManager and ColumnManager before systematic variations
+        _t0 = time.time()
         self.define_custom_axes_extra()
         self.define_histograms()
         self.define_histograms_extra()
+        print(f"[TIMING]     define_histograms: {time.time()-_t0:.3f}s")
+        _t0 = time.time()
         self.define_column_accumulators()
         self.define_column_accumulators_extra()
+        print(f"[TIMING]     define_column_accumulators: {time.time()-_t0:.3f}s")
 
+        n_variations = 0
         for variation in self.loop_over_variations():
+            n_variations += 1
+            _var_start = time.time()
+            _t_step = _var_start
+            print(f"[TIMING]     [Variation {variation}] start")
             # Custom code just after calibrations
             self.process_extra_after_calibrators(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] process_extra_after_calibrators: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
+
             # Apply preselections
             self.apply_object_preselection(variation)
             self.count_objects(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] apply_object_preselection+count_objects: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
+
             # Compute variables after object preselection
             self.define_common_variables_before_presel(variation)
             # Customization point for derived workflows after preselection cuts
             self.process_extra_before_presel(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] define_common_variables_before_presel+extra: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             # Prepare delayed branches snapshot on nominal before preselections filter out events
             if variation == "nominal":
                 self.delayed_branches.prepare_nominal_snapshot(self.events)
+                _t_now = time.time()
+                print(f"[TIMING]     [Variation {variation}] delayed_branches.prepare_nominal_snapshot: {_t_now-_t_step:.3f}s")
+                _t_step = _t_now
 
             # This will remove all the events not passing preselection
             # from further processing
@@ -896,7 +1009,12 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
             # If not events remains after the preselection we skip the chunk
             if not self.has_events:
+                print(f"[TIMING]     [Variation {variation}] No events after preselection, skipping. Time: {time.time()-_var_start:.3f}s")
                 continue
+
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] apply_preselections: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             ##########################
             # After the preselection cuts has been applied more processing is performend
@@ -904,30 +1022,74 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             # Customization point for derived workflows after preselection cuts
             self.define_common_variables_after_presel(variation)
             self.process_extra_after_presel(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] define_common_variables_after_presel+extra: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             # This function applies all the cut functions in the cfg file
             # Each category is an AND of some cuts.
             self.define_categories(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] define_categories: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             # Update delayed branches for this variation after final categories are defined
             # so they see the final selection masks
             self.delayed_branches.update_for_current_variation(self.events, self._categories)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] delayed_branches.update_for_current_variation: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             # Weights
             self.compute_weights(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] compute_weights: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
+            
             self.compute_weights_extra(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] compute_weights_extra: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             # Fill histograms
             self.fill_histograms(variation)
+
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] fill_histograms: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
+
             self.fill_histograms_extra(variation)
+
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] fill_histograms_extra: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
+
             self.fill_column_accumulators(variation)
+
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] fill_column_accumulators: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
+
             self.fill_column_accumulators_extra(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] fill_histograms+columns: {_t_now-_t_step:.3f}s")
+            _t_step = _t_now
 
             # Count events
             self.count_events(variation)
+            _t_now = time.time()
+            print(f"[TIMING]     [Variation {variation}] count_events: {_t_now-_t_step:.3f}s")
+            print(f"[TIMING]     [Variation {variation}] done. Time: {time.time()-_var_start:.3f}s")
 
         self.stop_time = time.time()
+        print(f"[TIMING]     Variations processed: {n_variations}")
+        _t0 = time.time()
+        self.flush_column_accumulators_to_root()
+        print(f"[TIMING]     flush_column_accumulators_to_root: {time.time()-_t0:.3f}s")
+        _t0 = time.time()
         self.save_processing_metadata()
+        print(f"[TIMING]     save_processing_metadata: {time.time()-_t0:.3f}s")
+        print(f"[TIMING]   [Chunk end] Total chunk time: {time.time()-_chunk_start:.3f}s")
         return self.output
 
 

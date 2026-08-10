@@ -224,9 +224,8 @@ def get_k(eta, var, cset, nested=False):
 
     # calculate residual smearing factor 
     # return 0 if smearing in MC already larger than in data
-    k_f = np.zeros_like(k_data_f)
-    condition = k_mc_f<k_data_f
-    k_f[condition] = (k_data_f[condition]**2 - k_mc_f[condition]**2)**.5
+    condition = k_mc_f < k_data_f
+    k_f = np.where(condition, np.sqrt(k_data_f**2 - k_mc_f**2), 0.)
 
     if nested:
         result = ak.unflatten(k_f, nmuons)

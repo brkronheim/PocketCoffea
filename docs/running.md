@@ -311,6 +311,7 @@ scheduling. Currently available:
 |-----------------|------------------|
 | `condor@lxplus` | CERN HTCondor    |
 | `condor@rubin`  | Maryland HTCondor |
+| `condor@cmsconnect` | cmsConnect / OSG-style remote HTCondor |
 
 This mode is best when:
 
@@ -382,6 +383,68 @@ You **must** provide either `--scaleout` or `max-events-per-job` — otherwise t
 splitting will produce a single job. The HTCondor `+JobFlavour` queues from shortest to
 longest are `espresso`, `microcentury`, `longlunch`, `workday`, `tomorrow`, `testmatch`,
 `nextweek`.
+
+#### cmsConnect remote Condor jobs
+
+`condor@cmsconnect` is designed for remote worker nodes with no AFS access. It uses
+an EL9 apptainer image, an XRootD-staged payload tarball containing the shared
+`Configurator`, compact `fileset_job_{i}.yaml` files, run-option YAML, and analysis
+payload, plus an optional separately staged Python environment tarball. Each worker
+fetches the payload and Python environment with `xrdcp`, activates the environment
+locally, runs PocketCoffea, then copies outputs and status markers to XRootD
+destinations with `xrdcp`.
+
+```bash
+pocket-coffea run --cfg config.py -o /eos/user/u/user/output \
+    --executor condor@cmsconnect --scaleout 50 \
+    --custom-run-options cmsconnect_options.yaml
+```
+
+Common cmsConnect options:
+
+```yaml
+worker-image: "/cvmfs/unpacked.cern.ch/gitlab-registry.cern.ch/batch-team/containers/plusbatch/el9:latest"
+ship-python-env: true                # tar, stage, and activate sys.prefix by default
+python-env-path: null                # set to an explicit venv/conda prefix if needed
+python-env-archive: null             # reuse a prebuilt tar.gz instead of creating one
+python-env-cache: true               # reuse the env tarball across submissions by default
+python-env-cache-dir: null           # defaults to ~/.cache/pocket_coffea/cmsconnect_python_envs
+python-env-force-repack: false       # set true after changing packages in the env
+python-env-exclude-packages:         # GPU-only packages are omitted from the shipped CPU env
+  - cupy
+  - cupy_backends
+  - jaxlib
+  - nvidia
+  - tensorflow
+  - tensorrt
+  - triton
+analysis-transfer-paths:             # copied into PYTHONPATH on the worker
+  - "*.py"
+  - workflow
+  - scripts
+  - params
+  - MVA
+staging-area: null                   # defaults to <output-destination>/cmsconnect_staging/<job-name>
+output-destination: null             # arbitrary XRootD output directory; defaults to -o when -o is under /eos/
+status-destination: null             # defaults to <output-destination>/status for check-jobs polling
+convert-parquet-to-root: false       # merge dumped per-chunk column ROOT files into one per-job ROOT file
+parquet-output-dir: columns          # local worker directory used for dumped column ROOT chunks
+keep-coffea-output: true             # set false to return only converted ROOT output
+```
+
+When `convert-parquet-to-root: true` is enabled and the workflow writes column arrays
+through `dump_columns_as_arrays_per_chunk`, the worker rewrites that destination to the
+local `parquet-output-dir`, merges the per-chunk ROOT files with `parquet-to-root`, and
+copies `output_job_{i}_skim.root` to `output-destination` with `xrdcp`. The same XRootD
+copy path is used for `output_job_{i}.coffea` when `keep-coffea-output: true`.
+
+For the smallest worker environment, create a dedicated CPU-only venv for cmsConnect
+and pass it with `python-env-path`. It should contain PocketCoffea and the runtime
+packages required by the workflow, such as `coffea`, `awkward`, `numpy`, `numba`,
+`hist`, `correctionlib`, `xrootd`, `pyyaml`, `cloudpickle`, and only the CPU variants
+of ML runtimes actually used by the analysis. The default packer also skips Python
+caches, tests, docs, static libraries, and common GPU-only package directories before
+staging the cached tarball.
 
 ##### Per-sample `max-events-per-job`
 
@@ -461,8 +524,10 @@ This is currently implemented for the manual-job executors (`condor@lxplus`,
 
 The HTCondor-based manual-job executors (`condor@lxplus`, `condor@rubin`, ...) submit one
 HTCondor job per chunk-group and pickle the per-job `Configurator` to
-`jobs_dir/config_job_{i}.pkl`. To resubmit a subset of these jobs without re-running the
-splitting, use `--recreate-jobs`:
+`jobs_dir/config_job_{i}.pkl`. `condor@cmsconnect` instead keeps one shared configurator
+and stores each job fileset in `jobs_dir/fileset_job_{i}.yaml`; `check-jobs --resubmit`
+updates either format when it rewrites failed XRootD paths. To resubmit a subset of the
+legacy pickle-based jobs without re-running the splitting, use `--recreate-jobs`:
 
 ```bash
 # Resubmit specific jobs

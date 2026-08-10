@@ -104,15 +104,44 @@ def create_layout(with_progress=False):
     return layout
 
 def check_jobs_logs(jobs_folder):
+    _sync_remote_status_files(jobs_folder)
      # Idle jobs
-    idle_jobs = [ a.split("/")[-1][:-5] for a in glob.glob(f"{jobs_folder}/job_*.idle")]
+    idle_jobs = set([ a.split("/")[-1][:-5] for a in glob.glob(f"{jobs_folder}/job_*.idle")])
     # Running jobs
-    running_jobs = [a.split("/")[-1][:-8] for a in glob.glob(f"{jobs_folder}/job_*.running")]
+    running_jobs = set([a.split("/")[-1][:-8] for a in glob.glob(f"{jobs_folder}/job_*.running")])
     # Done jobs
-    done_jobs = [ a.split("/")[-1][:-5] for a in glob.glob(f"{jobs_folder}/job_*.done")]
+    done_jobs = set([ a.split("/")[-1][:-5] for a in glob.glob(f"{jobs_folder}/job_*.done")])
     # Failed jobs
-    failed_jobs = [ a.split("/")[-1][:-7] for a in glob.glob(f"{jobs_folder}/job_*.failed")]
-    return idle_jobs, running_jobs, done_jobs, failed_jobs
+    failed_jobs = set([ a.split("/")[-1][:-7] for a in glob.glob(f"{jobs_folder}/job_*.failed")])
+    for status_path in glob.glob(f"{jobs_folder}/job_*.status"):
+        job = status_path.split("/")[-1][:-7]
+        with open(status_path) as handle:
+            status = handle.read().strip()
+        if status == "done":
+            done_jobs.add(job)
+        elif status == "failed":
+            failed_jobs.add(job)
+    failed_jobs = failed_jobs - done_jobs
+    running_jobs = running_jobs - done_jobs - failed_jobs
+    idle_jobs = idle_jobs - done_jobs - failed_jobs - running_jobs
+    return list(idle_jobs), list(running_jobs), list(done_jobs), list(failed_jobs)
+
+
+def _sync_remote_status_files(jobs_folder):
+    jobs_config = Path(jobs_folder) / "jobs_config.yaml"
+    if not jobs_config.is_file():
+        return
+    with open(jobs_config) as handle:
+        payload = yaml.safe_load(handle) or {}
+    status_destination = payload.get("status_destination")
+    if not status_destination:
+        return
+    for sub_path in glob.glob(f"{jobs_folder}/job_*.sub"):
+        job = Path(sub_path).stem
+        remote_status = status_destination.rstrip("/") + f"/{job}.status"
+        local_status = str(Path(jobs_folder) / f"{job}.status")
+        sp.run(["xrdcp", "-f", remote_status, local_status],
+               stdout=sp.DEVNULL, stderr=sp.DEVNULL, check=False)
 
 
 def get_progress_table(group_counts, label, multi_sample_overlap=False, bar_width=30):
@@ -184,6 +213,25 @@ def update_blacklist(xrootdfaillist,blacklist_threshold):
         if fails > blacklist_threshold:
             blacklist_sites.append(site)
     return blacklist_sites
+
+
+def _load_job_fileset(jobs_folder, failed_job):
+    fileset_yaml = f"{jobs_folder}/fileset_{failed_job}.yaml"
+    if os.path.isfile(fileset_yaml):
+        with open(fileset_yaml) as handle:
+            return yaml.safe_load(handle), fileset_yaml, None
+    config_file = f"{jobs_folder}/config_{failed_job}.pkl"
+    config = cloudpickle.load(open(config_file, "rb"))
+    return config.filesets, config_file, config
+
+
+def _save_job_fileset(fileset, target_path, config=None):
+    if target_path.endswith(".yaml"):
+        with open(target_path, "w") as handle:
+            yaml.safe_dump(fileset, handle, sort_keys=False)
+        return
+    config.set_filesets_manually(fileset)
+    cloudpickle.dump(config, open(target_path, "wb"))
 
 def bump_jobqueue(sub_file, shift=1):
     with open(sub_file) as f:
@@ -320,12 +368,16 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
                         failed_job_num = failed_job.split('_')[1]
 
                         if not failed_job in definitive_failed:
-                            # Check the log file
-                            glob_file = glob.glob(f"{jobs_folder}/logs/job_*.{failed_job_num}.out")
+                            # Check the log files
+                            glob_out = glob.glob(f"{jobs_folder}/logs/job_*.{failed_job_num}.out")
+                            glob_err = glob.glob(f"{jobs_folder}/logs/job_*.{failed_job_num}.err")
+                            glob_file = glob_out if glob_out else glob_err
                             xrootdfile = None
-                            if glob_file:
-                                with open(glob_file[-1]) as f:
-                                    c = f.readlines()
+                            c = []
+                            for log_path in glob_out[-1:] + glob_err[-1:]:
+                                with open(log_path) as f:
+                                    c.extend(f.readlines())
+                            if c:
                                     for iln,ln in enumerate(c):
                                         if "OSError: XRootD error" in ln:
                                             xrootdfile = c[iln+1].strip().split()[-1]
@@ -340,7 +392,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
                                         log_text.append( f"[b]Job {failed_job} failed[/] {failed_jobs_stats[failed_job]} times. Last error:")
                                         log_text.append("\t"+ "".join(c[-3:]))
                             else:
-                                log_text.append( f"Error in job {failed_job}: No .err file found")
+                                log_text.append( f"Error in job {failed_job}: No .out/.err file found")
 
                             if resubmit and failed_jobs_stats[failed_job] <= max_resubmit:
                                 if xrootdfile:
@@ -355,14 +407,12 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
                                             log_text.append(f"[red][b]New blacklist sites[/]: {new_blacklist_sites[-diff:]}[/]")
                                             blacklist_sites = new_blacklist_sites
 
-                                    # Move the .err file so that this xrootdfile is not marked again as an XRootD failure
-                                    if glob_file:
-                                        os.system(f"mv {glob_file[-1]} {jobs_folder}/logs/processedlogs")
+                                    # Move the logs so that this xrootdfile is not marked again as an XRootD failure
+                                    for log_path in glob_out[-1:] + glob_err[-1:]:
+                                        os.system(f"mv {log_path} {jobs_folder}/logs/processedlogs")
 
                                     # Update the filelist in the failed job's config to exclude this failed file
-                                    thisconfigfile = f"{jobs_folder}/config_{failed_job}.pkl"
-                                    config = cloudpickle.load(open(thisconfigfile, "rb"))
-                                    current_fileset = config.filesets
+                                    current_fileset, job_state_path, config = _load_job_fileset(jobs_folder, failed_job)
                                     new_fileset = deepcopy(current_fileset)
                                     for sample, dct in new_fileset.items():
                                         fllist = dct['files']
@@ -371,8 +421,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
                                             newfl = find_other_file(xrootdfile,sitemap,xrootdfaillist,blacklist_sites,rucio_client=rucio_client)
                                             if newfl != xrootdfile:
                                                 new_fileset[sample]['files'][flidx] = newfl
-                                                config.set_filesets_manually(new_fileset)
-                                                cloudpickle.dump(config, open(thisconfigfile, "wb"))
+                                                _save_job_fileset(new_fileset, job_state_path, config)
                                                 log_text.append(f"[b]Job {failed_job}[/]: Updated XRootD path of failed file to a new site.")
                                             else:
                                                 log_text.append(f"[b]Job {failed_job}[/]: No alternative site found for {xrootdfile}. Resubmitting with the same file!")
@@ -403,8 +452,7 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
                                             
                                             new_fileset[sample]['files'] = newfllist
 
-                                        config.set_filesets_manually(new_fileset)
-                                        cloudpickle.dump(config, open(thisconfigfile, "wb"))
+                                        _save_job_fileset(new_fileset, job_state_path, config)
 
                                         if flcounter > 0:
                                             log_text.append(f"[b]Job {failed_job}[/]: Replaced {flcounter} files in config because they were in {len(sitecounter)} blacklisted sites: {sitecounter}.")
@@ -437,7 +485,11 @@ def check_jobs(jobs_folder, details, resubmit, max_resubmit, blacklist_threshold
 
                 # check in the logs for SYSTEM_PERIODIC_REMOVE
                 # they are not failed but remain running/idle
-                log_file = glob.glob(f"{jobs_folder}/logs/job_*.log")[0]
+                log_files = glob.glob(f"{jobs_folder}/logs/job_*.log")
+                if not log_files:
+                    time.sleep(5)
+                    continue
+                log_file = log_files[0]
                 with open(log_file) as f:
                     c = f.readlines()
                 

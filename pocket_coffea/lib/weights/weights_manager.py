@@ -1,13 +1,17 @@
 from dataclasses import dataclass
-import inspect
-import awkward as ak
 import numpy as np
-import copy
-from collections.abc import Callable
+import time
 from collections import defaultdict
 
 from coffea.analysis_tools import Weights
+from coffea.util import _ensure_flat
 from .weights import WeightData, WeightDataMultiVariation
+
+
+def _copy_for_coffea_variation(weight_variation):
+    if weight_variation is None:
+        return None
+    return np.array(_ensure_flat(weight_variation, allow_missing=True), copy=True)
 
 
 class WeightsManager:
@@ -128,6 +132,7 @@ class WeightsManager:
         Load the weights for the current chunk following the user configuration.
         This created different Weights objects for the inclusive and bycategory weights.
         '''
+        _t0 = time.time()
         _weightsCache = {}
          # looping on the weights configuration to create the
 
@@ -143,13 +148,14 @@ class WeightsManager:
             self._installed_modifiers_inclusive_subsamples = { sub: [] for sub in self.weightsConf_subsamples }
             self._installed_modifiers_bycat_subsamples = { sub: defaultdict(list) for sub in self.weightsConf_subsamples }
         
-        def __add_weight(w, weight_obj):
+        def __add_weight(w, weight_obj, _depth_tag=""):
             installed_modifiers = []
             if w not in self._available_weights:
                 # it means that the weight is defined in a processor.
                 # The configurator has already checked that it is defined somewhere.
                 # DO nothing
                 return
+            _t_comp = time.time()
             if w not in _weightsCache:
                 out = self._weightsObj[w].compute(
                     events, size, shape_variation
@@ -158,10 +164,23 @@ class WeightsManager:
                 _weightsCache[w] = out
             else:
                 out = _weightsCache[w]
-
-            # Copy the WeightData object to avoid modifying the original
-            # FIXME: there is a coffea bug which modifies in place the weight variation array
-            out = copy.deepcopy(out)
+            # Coffea modifies weightUp/weightDown in-place after flattening them.
+            # Copy at that same flat NumPy layer to avoid expensive Awkward copies.
+            if isinstance(out, WeightData):
+                out = WeightData(
+                    name=out.name,
+                    nominal=out.nominal,
+                    up=_copy_for_coffea_variation(out.up),
+                    down=_copy_for_coffea_variation(out.down),
+                )
+            elif isinstance(out, WeightDataMultiVariation):
+                out = WeightDataMultiVariation(
+                    name=out.name,
+                    nominal=out.nominal,
+                    variations=list(out.variations),
+                    up=[_copy_for_coffea_variation(u) for u in out.up] if out.up is not None else None,
+                    down=[_copy_for_coffea_variation(d) for d in out.down] if out.down is not None else None,
+                )
                 
             if isinstance(out, WeightData):
                 weight_obj.add(out.name, out.nominal, out.up, out.down)
@@ -180,23 +199,24 @@ class WeightsManager:
             
 
         # Compute first the inclusive weights
+        _t_incl = time.time()
         for w in self.weightsConf["inclusive"]:
-            # print(f"Adding weight {w} inclusively")
-            modifiers = __add_weight(w, self._weightsIncl)
-            # Save the list of availbale modifiers
-            self._installed_modifiers_inclusive += modifiers
+            modifiers = __add_weight(w, self._weightsIncl, _depth_tag="inclusive/")
+            self._installed_modifiers_inclusive += (modifiers or [])
+        _t_incl_end = time.time()
 
         # Now weights for dedicated categories
         if self.weightsConf["is_split_bycat"]:
-            # Create the weights object only if for the current sample
-            # there is a weights_by_category configuration
+            _t_bycat = time.time()
+            n_cats_with_weights = 0
             for cat, ws in self.weightsConf["bycategory"].items():
                 if len(ws) == 0:
                     continue
+                n_cats_with_weights += 1
                 self._weightsByCat[cat] = Weights(size, self.storeIndividual)
                 for w in ws:
-                    modifiers = __add_weight(w, self._weightsByCat[cat])
-                    self._installed_modifiers_bycat[cat] += modifiers
+                    modifiers = __add_weight(w, self._weightsByCat[cat], _depth_tag=f"bycat/{cat}/")
+                    self._installed_modifiers_bycat[cat] += (modifiers or [])
 
         # make the variations unique
         self._installed_modifiers_inclusive = set(self._installed_modifiers_inclusive)
@@ -206,19 +226,20 @@ class WeightsManager:
 
         # The same but looking at the ones specific for the subsamples
         if self.has_subsamples:
+            _t_sub = time.time()
             for subsample, subsample_conf in self.weightsConf_subsamples.items():
                 self._installed_modifiers_inclusive_subsamples[subsample] = []
                 for w in subsample_conf["inclusive"]:
-                    modifiers = __add_weight(w, self._weightsIncl_subsamples[subsample])
-                    self._installed_modifiers_inclusive_subsamples[subsample] += modifiers
+                    modifiers = __add_weight(w, self._weightsIncl_subsamples[subsample], _depth_tag=f"sub/{subsample}/inclusive/")
+                    self._installed_modifiers_inclusive_subsamples[subsample] += (modifiers or [])
                 if subsample_conf["is_split_bycat"]:
                     for cat, ws in subsample_conf["bycategory"].items():
                         if len(ws) == 0:
                             continue
                         self._weightsByCat_subsamples[subsample][cat] = Weights(size, self.storeIndividual)
                         for w in ws:
-                            modifiers = __add_weight(w, self._weightsByCat_subsamples[subsample][cat])
-                            self._installed_modifiers_bycat_subsamples[subsample][cat] += modifiers
+                            modifiers = __add_weight(w, self._weightsByCat_subsamples[subsample][cat], _depth_tag=f"sub/{subsample}/bycat/{cat}/")
+                            self._installed_modifiers_bycat_subsamples[subsample][cat] += (modifiers or [])
 
             self._installed_modifiers_inclusive_subsamples = {
                 k: set(v) for k, v in self._installed_modifiers_inclusive_subsamples.items()

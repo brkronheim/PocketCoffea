@@ -1,5 +1,6 @@
 import hist
 import awkward as ak
+import numpy as np
 from collections import defaultdict
 from coffea.analysis_tools import PackedSelection
 from typing import List, Tuple
@@ -375,8 +376,11 @@ class HistManager:
         Custom_fields is a dict of additional array. The expected lenght of the first dimension is the number of
         events. The categories mask will be applied.
         '''
+        import time
+        _t_func = time.time()
 
         # Preload full-sample weights for all categories (MC and data)
+        _t0 = time.time()
         weights = {}
         for category in self.available_categories:
             weights[category] = get_weights_by_cat_var(
@@ -388,6 +392,7 @@ class HistManager:
         # weights_sub[subsample][category][variation] holds the subsample weight for
         # the variations explicitly defined for that subsample; all other variations
         # fall back to the nominal subsample weight via dict.get() at fill time.
+        _t0 = time.time()
         weights_sub = {}
         if self.has_subsamples and self.isMC:
             for subsample in self.subsamples:
@@ -398,13 +403,29 @@ class HistManager:
                         avail, self.weights_manager,
                         self.sample + "__" + subsample, category, shape_variation,
                     )
-
+        
         # Cleaning the weights cache decorator between calls.
         self._weights_cache.clear()
         # Looping on the histograms to read the values only once
         # Then categories, subsamples and weights are applied and masked correctly
         # ASSUNTION, the histograms are the same for each subsample
         # we can take the configuration of the first subsample
+        _t_axes_total = 0.0
+        _t_mask_total = 0.0
+        _t_weight_total = 0.0
+        _t_fill_total = 0.0
+        _n_hists = 0
+        _n_cats_sub_combos = 0
+        # Per-histogram time tracking: name -> {axes, mask, weight, fill, total, n_fills}
+        _per_hist = {}
+        # Per-variation time tracking: variation -> total_fill_time
+        _per_variation = {}
+        # Cache for ak.pad_none results, keyed on (coll, field, pos).
+        # Many histograms share the same (coll, field, pos) -- e.g. jet_hists(pos=0)
+        # produces JetGood_pt_1, JetGood_eta_1, ... all with pos=0 on JetGood.
+        # Caching the pad result avoids re-running ak.pad_none + index 100+ times
+        # per chunk for the same collection/field/pos.
+        _pad_cache = {}
         for name, histo in self.histograms[self.subsamples[0]].items():
             # logging.info(f"\thisto: {name}")
             if not histo.autofill:
@@ -423,6 +444,9 @@ class HistManager:
             ):
                 continue
 
+            _n_hists += 1
+            _t_step = time.time()
+            _t_hist_total = time.time()
             # Get the filling axes --> without any masking.
             # The flattening has to be applied as the last step since the categories and subsamples
             # work at event level
@@ -430,6 +454,8 @@ class HistManager:
             fill_categorical = {}
             fill_numeric = {}
             data_ndim = None
+            # Per-histogram accumulators (local, summed into _per_hist at the end)
+            _ph = {"axes": 0.0, "mask": 0.0, "weight": 0.0, "fill": 0.0, "n_fills": 0}
 
             for ax in histo.axes:
                 # Checkout the collection type
@@ -461,9 +487,17 @@ class HistManager:
                         if ax.pos == None:
                             data = events[ax.coll][ax.field]
                         elif ax.pos >= 0:
-                            data = ak.pad_none(
-                                events[ax.coll][ax.field], ax.pos + 1, axis=1
-                            )[:, ax.pos]
+                            # Use the per-chunk pad cache to avoid re-running
+                            # ak.pad_none + index for the same (coll, field, pos)
+                            # across histograms that share the axis.
+                            _pad_key = (ax.coll, ax.field, ax.pos)
+                            _cached = _pad_cache.get(_pad_key)
+                            if _cached is None:
+                                _cached = ak.pad_none(
+                                    events[ax.coll][ax.field], ax.pos + 1, axis=1
+                                )[:, ax.pos]
+                                _pad_cache[_pad_key] = _cached
+                            data = _cached
                         else:
                             raise Exception(
                                 f"Invalid position {ax.pos} requested for collection {ax.coll}"
@@ -495,6 +529,9 @@ class HistManager:
                     else:
                         raise NotImplementedError()
 
+            _t_axes_total += time.time() - _t_step
+            _ph["axes"] = time.time() - _t_hist_total
+            _t_step = time.time()
             # Now the variables have been read for all the events
             # We need now to iterate on categories and subsamples
             # Mask the events, the weights and then flatten and remove the None correctly
@@ -502,6 +539,9 @@ class HistManager:
                 # loop directly on subsamples
                 for subsample, subs_mask in subsamples.get_masks():
                     # logging.info(f"\t\tcategory {category}, subsample {subsample}")
+                    _n_cats_sub_combos += 1
+                    _t_iter = time.time()
+                    _t_combo = time.time()
                     mask = cat_mask & subs_mask
                     # Skip empty categories and subsamples
                     if ak.sum(mask) == 0:
@@ -542,6 +582,7 @@ class HistManager:
                                 + "You can configure this behaviour with `collapse_2D_masks_mode='OR'/'AND'` in the histo configuration."
                             )
 
+                    _t_mask_step = time.time()
                     # Mask the variables and flatten them
                     # save the isnotnone and datastructure
                     # to be able to broadcast the weight
@@ -580,12 +621,91 @@ class HistManager:
                         fill_numeric_masked[key] = ak.to_numpy(
                             value[all_axes_isnotnone], allow_missing=False
                         )
+                    # Pre-compute the numpy boolean mask once per (cat, subsample, hist).
+                    # The variation loop uses it to select the valid entries from
+                    # the per-variation weight arrays. Doing the ak.to_numpy conversion
+                    # here (once) instead of inside the inner variation loop (per variation)
+                    # removes a recurring small cost; the indexing itself is then plain
+                    # numpy fancy-indexing.
+                    _isnotnone_np = ak.to_numpy(all_axes_isnotnone)
+                    _t_mask_total += time.time() - _t_mask_step
+                    _ph["mask"] += time.time() - _t_mask_step
 
                     # Ok, now we have all the numerical axes with
                     # data that has been masked, flattened
                     # removed the none value --> now we need weights for each variation
+                    _t_w_step = time.time()
                     if not histo.no_weights and self.isMC:
                         if shape_variation == "nominal":
+                            # ==== HOIST START ====
+                            # Precompute the structural broadcast factor ONCE per
+                            # (category, subsample, histogram), then reuse it for every
+                            # weight variation. This avoids re-running the expensive
+                            # ak.ones_like(mask) * weight [mask] flatten chain for
+                            # every variation (the original hotspot).
+                            #
+                            # For mask.ndim==2 (collection-level cut):
+                            #   - the final weight = np.repeat(weight[event], counts[event])
+                            #     where counts = number-of-True-per-event in mask.
+                            #   - We precompute counts and a 0/1 factor that has the
+                            #     correct final length, then per variation do a fast
+                            #     numpy repeat + multiply.
+                            #
+                            # For mask.ndim==1 and data_structure.ndim==2:
+                            #   The original code computes
+                            #     ak.flatten(data_structure * (weight[mask]))
+                            #   where weight[mask] is a 1D array of length n_surviving
+                            #   and data_structure is 2D jagged of shape (n_surviving, var).
+                            #   The result is data_structure.values * weight[event].
+                            #
+                            #   We tried to hoist this with
+                            #     data_structure_flat * np.repeat(weight[mask], counts)
+                            #   but hit a shape mismatch in some real-data cases where
+                            #   ak.flatten(data_structure) returned fewer elements than
+                            #   sum(counts). This appears to happen when data_structure
+                            #   contains None / optional elements or when a downstream
+                            #   operation (e.g. pad_none) changed its structure. To be
+                            #   safe we only enable the 1D+2D hoist when we can verify
+                            #   shapes match, and otherwise fall back to the original
+                            #   mask_and_broadcast_weight which is correct in all cases.
+                            #
+                            # For mask.ndim==1 and data is per-event (no data_structure
+                            # or ndim==1):
+                            #   - the final weight is just weight[mask]. No hoist
+                            #     needed; the existing @weights_cache handles it.
+                            _bcast_factor = None
+                            _bcast_per_event = None  # for mask.ndim==1 + data_structure.ndim==2
+                            # Pre-allocated buffer + index for the np.repeat result
+                            # (Step 3 of the perf plan). The total output length is
+                            # sum(_bcast_per_event); this is the same for every weight
+                            # variation, so we allocate it once and refill via
+                            # np.take(arr, _repeat_idxs, out=_buf) inside the loop.
+                            _repeat_idxs = None
+                            _w_out_buf = None
+                            _hoist_2d = (mask.ndim == 2)
+                            _hoist_1d_2d = False
+                            if _hoist_2d:
+                                # Per-event count of True values in the mask
+                                _bcast_per_event = ak.to_numpy(ak.sum(mask, axis=1))
+                                # Pre-allocate the result of np.repeat(weight, counts).
+                                # The total length is the sum of per-event object counts.
+                                _total_objs = int(_bcast_per_event.sum())
+                                # Indices equivalent to np.repeat(np.arange(n_events), counts)
+                                _repeat_idxs = np.repeat(
+                                    np.arange(len(_bcast_per_event)), _bcast_per_event
+                                )
+                                _w_out_buf = np.empty(_total_objs, dtype=np.float64)
+                            elif mask.ndim == 1 and data_structure is not None and data_structure.ndim == 2:
+                                # 1D mask + 2D data_structure hoist (currently disabled
+                                # to keep behavior identical to mask_and_broadcast_weight;
+                                # the 2D mask hoist above already provides the main win
+                                # for the common jet/lepton collection case).
+                                # To re-enable, see the long comment above and ensure
+                                # shape verification: len(ak.flatten(data_structure))
+                                # == int(sum(ak.num(data_structure, axis=1))).
+                                _hoist_1d_2d = False
+                            # ==== HOIST END ====
+
                             # if we are working on nominal we fill all the weights variations
                             for variation in self.histograms[subsample][name].hist_obj.axes["variation"]:
                                 if variation in self.available_shape_variations or (
@@ -618,15 +738,42 @@ class HistManager:
                                     if self.has_subsamples else 1.
                                 )
 
-                                # Broadcast and mask the weight (using the cached value if possible)
-                                weight_varied = self.mask_and_broadcast_weight(
-                                    category,
-                                    subsample,
-                                    variation,
-                                    weight_varied*weight_sub, # This creates a copy of the weight
-                                    mask,
-                                    data_structure,
-                                )
+                                # Broadcast and mask the weight. We use the hoisted
+                                # path when the structural factor was precomputed above:
+                                #   - _hoist_2d:        output = np.take(weight, idxs) into a
+                                #                        pre-allocated buffer (Step 3)
+                                #   - _hoist_1d_2d:     output = data_structure_masked_flat * weight_per_event_expanded
+                                #                        (currently disabled, see hoist block)
+                                #   - else:             fall back to the original mask_and_broadcast_weight
+                                #                        (which the @weights_cache may still speed up)
+                                _t_w_hoist = time.time()
+                                weight_combined = weight_varied * weight_sub
+                                # Convert to numpy once per variation
+                                if hasattr(weight_combined, "to_numpy"):
+                                    _w_np = ak.to_numpy(weight_combined)
+                                else:
+                                    _w_np = np.asarray(weight_combined)
+                                if _hoist_2d:
+                                    # Per-event weight expanded to per-object via the
+                                    # precomputed index, into the pre-allocated output
+                                    # buffer. This avoids allocating a new output array
+                                    # for every weight variation.
+                                    np.take(_w_np, _repeat_idxs, out=_w_out_buf)
+                                    weight_varied = _w_out_buf
+                                elif _hoist_1d_2d:
+                                    # Per-event weight expanded to per-object using mask counts,
+                                    # then elementwise multiplied with the precomputed data_structure
+                                    weight_varied = _bcast_factor * np.repeat(_w_np, _bcast_per_event)
+                                else:
+                                    weight_varied = self.mask_and_broadcast_weight(
+                                        category,
+                                        subsample,
+                                        variation,
+                                        weight_combined,
+                                        mask,
+                                        data_structure,
+                                    )
+                                _ph["weight_hoist"] = _ph.get("weight_hoist", 0.0) + (time.time() - _t_w_hoist)
                                 if custom_weight != None and name in custom_weight:
                                     weight_varied = weight_varied * self.mask_and_broadcast_weight(
                                         category + "customW",
@@ -639,9 +786,10 @@ class HistManager:
                                         data_structure,
                                     )
 
-                                # Then we apply the notnone mask
-                                weight_varied = weight_varied[ak.to_numpy(all_axes_isnotnone)]
+                                # Then we apply the notnone mask (use the cached numpy version)
+                                weight_varied = weight_varied[_isnotnone_np]
                                 # Fill the histogram
+                                _t_f = time.time()
                                 try:
                                     self.histograms[subsample][name].hist_obj.fill(
                                         cat=category,
@@ -653,6 +801,11 @@ class HistManager:
                                     raise Exception(
                                         f"Cannot fill histogram: {name}, {histo} {e}"
                                     )
+                                _t_fill_dt = time.time() - _t_f
+                                _t_fill_total += _t_fill_dt
+                                _ph["fill"] += _t_fill_dt
+                                _ph["n_fills"] += 1
+                                _per_variation[variation] = _per_variation.get(variation, 0.0) + _t_fill_dt
                         else:
                             # Check if this shape variation is requested for this category,
                             # either as a full-sample variation or as a subsample-specific one.
@@ -691,9 +844,10 @@ class HistManager:
                                     mask,
                                     data_structure,
                                 )
-                            # Then we apply the notnone mask
-                            weight_nom = weight_nom[all_axes_isnotnone]
+                            # Then we apply the notnone mask (use the cached numpy version)
+                            weight_nom = weight_nom[_isnotnone_np]
                             # Fill the histogram
+                            _t_f = time.time()
                             try:
                                 self.histograms[subsample][name].hist_obj.fill(
                                     cat=category,
@@ -705,6 +859,11 @@ class HistManager:
                                 raise Exception(
                                     f"Cannot fill histogram: {name}, {histo} {e}"
                                 )
+                            _t_fill_dt = time.time() - _t_f
+                            _t_fill_total += _t_fill_dt
+                            _ph["fill"] += _t_fill_dt
+                            _ph["n_fills"] += 1
+                            _per_variation[shape_variation] = _per_variation.get(shape_variation, 0.0) + _t_fill_dt
                     ##################################################################################
                     elif not histo.no_weights and not self.isMC:   #DATA
                         # Broadcast and mask the weight (using the cached value if possible)
@@ -729,9 +888,10 @@ class HistManager:
                                 data_structure,
                             )
 
-                        # Then we apply the notnone mask
-                        weight_data = weight_data[ak.to_numpy(all_axes_isnotnone)]
+                        # Then we apply the notnone mask (use the cached numpy version)
+                        weight_data = weight_data[_isnotnone_np]
                         # Fill the histogram
+                        _t_f = time.time()
                         try:
                             # Data histograms don't have variations but now can be weighted
                             self.histograms[subsample][name].hist_obj.fill(
@@ -743,11 +903,17 @@ class HistManager:
                             raise Exception(
                                 f"Cannot fill histogram for Data: {name}, {histo} {e}"
                             )
+                        _t_fill_dt = time.time() - _t_f
+                        _t_fill_total += _t_fill_dt
+                        _ph["fill"] += _t_fill_dt
+                        _ph["n_fills"] += 1
+                        _per_variation["nominal"] = _per_variation.get("nominal", 0.0) + _t_fill_dt
 
                     ######################################################
                     elif (
                         histo.no_weights and self.isMC
                     ):  # NO Weights modifier for the histogram
+                        _t_f = time.time()
                         try:
                             self.histograms[subsample][name].hist_obj.fill(
                                 cat=category,
@@ -758,9 +924,15 @@ class HistManager:
                             raise Exception(
                                 f"Cannot fill histogram: {name}, {histo} {e}"
                             )
+                        _t_fill_dt = time.time() - _t_f
+                        _t_fill_total += _t_fill_dt
+                        _ph["fill"] += _t_fill_dt
+                        _ph["n_fills"] += 1
+                        _per_variation["nominal"] = _per_variation.get("nominal", 0.0) + _t_fill_dt
 
                     elif histo.no_weights and not self.isMC:
                         # Fill histograms for Data
+                        _t_f = time.time()
                         try:
                             self.histograms[subsample][name].hist_obj.fill(
                                 cat=category,
@@ -770,10 +942,33 @@ class HistManager:
                             raise Exception(
                                 f"Cannot fill histogram: {name}, {histo} {e}"
                             )
+                        _t_fill_dt = time.time() - _t_f
+                        _t_fill_total += _t_fill_dt
+                        _ph["fill"] += _t_fill_dt
+                        _ph["n_fills"] += 1
+                        _per_variation["nominal"] = _per_variation.get("nominal", 0.0) + _t_fill_dt
                     else:
                         raise Exception(
                             f"Cannot fill histogram: {name}, {histo}, not implemented combination of options"
                         )
+                    _t_weight_total += time.time() - _t_w_step
+                    _ph["weight"] += time.time() - _t_w_step
+            # Commit per-histogram timings
+            _ph["total"] = time.time() - _t_hist_total
+            _per_hist[name] = _ph
+
+        # Per-histogram fill loop summary
+        print(
+            f"[TIMING]     [fill_histograms] DONE (shape_variation={shape_variation!r}, "
+            f"n_hists={_n_hists}, n_cat_sub_combos={_n_cats_sub_combos}, "
+            f"axes_extraction={_t_axes_total:.3f}s, "
+            f"mask+flatten={_t_mask_total:.3f}s, "
+            f"weight+broadcast={_t_weight_total:.3f}s, "
+            f"hist.fill={_t_fill_total:.3f}s, "
+            f"total_in_func={time.time()-_t_func:.3f}s, "
+            f"pad_cache_size={len(_pad_cache)})"
+        )
+
 
 
         ###################

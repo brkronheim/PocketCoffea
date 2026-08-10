@@ -1,4 +1,5 @@
 import gzip
+import functools
 import cloudpickle
 import awkward as ak
 import numpy as np
@@ -26,8 +27,15 @@ def add_jec_variables(jets, event_rho, isMC=True):
             # NanoAODv12 does not have rawMass for corrT1METjet
             jets["mass_raw"] = ak.zeros_like(jets.rawPt)
     else:
-        jets["pt_raw"] = (1 - jets.rawFactor) * jets.pt
-        jets["mass_raw"] = (1 - jets.rawFactor) * jets.mass
+        if "rawFactor" in jets.fields:
+            # Regular jets: pt_raw is computed by removing the JEC correction
+            jets["pt_raw"] = (1 - jets.rawFactor) * jets.pt
+            jets["mass_raw"] = (1 - jets.rawFactor) * jets.mass
+        else:
+            # CorrT1METJet: pt is already raw (aliased from rawPt in the schema),
+            # and there is no rawFactor branch in the NanoAOD file.
+            jets["pt_raw"] = jets.pt
+            jets["mass_raw"] = jets.mass
     jets["event_rho"] = ak.broadcast_arrays(event_rho, jets.pt)[0]
     if isMC:
         try:
@@ -304,6 +312,7 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         "eta": 0.,
         "phi": 0.,
         "mass": 0.,
+        "charge": 0.,
     }
     
     if remnant_jet:
@@ -312,6 +321,7 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         "eta": 0.,
         "phi": 0.,
         "mass": 0.,
+        "charge": 0.,
     }
 
     jets = ak.pad_none(jets, 2)
@@ -367,6 +377,7 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         return dijet, remnant
 
 
+@functools.lru_cache(maxsize=8)
 def get_jer_correction_set(jer_json, jer_ptres_tag, jer_sf_tag):
     # learned from: https://github.com/cms-nanoAOD/correctionlib/issues/130
     with gzip.open(jer_json) as fin:

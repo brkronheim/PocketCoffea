@@ -1,4 +1,5 @@
 import os, getpass
+import subprocess
 import sys
 import argparse
 import cloudpickle
@@ -14,6 +15,219 @@ from rich.console import Console
 
 from coffea.util import save
 from coffea.nanoevents import NanoAODSchema
+from coffea.nanoevents.trace import trace as coffea_trace
+from coffea.nanoevents.trace import (
+    _form_keys_to_columns as _original_form_keys_to_columns,
+    trace_with_length_zero_array,
+    trace_with_length_one_array,
+)
+from coffea.nanoevents.util import unquote as _unquote
+
+import awkward as ak
+
+
+# ---------------------------------------------------------------------------
+# Helper: extract leaf-level branch names from a NanoEvents form dict
+# ---------------------------------------------------------------------------
+def _collect_form_branches(form_node, prefix=""):
+    """Recursively extract NanoAOD branch names from an awkward Form (or dict).
+
+    NanoEventsFactory builds a form where:
+      - ``NumpyArray`` nodes have a *form_key* that IS the branch name,
+      - ``ListOffsetArray`` / ``RecordArray`` nodes do not correspond to
+        branches themselves — only their leaf ``NumpyArray`` children do.
+
+    Returns a set of branch-name strings.
+    """
+    branches = set()
+
+    # Accept both the raw-dict form (as stored in events.attrs["@form"])
+    # and already-parsed ak.forms.Form objects.
+    if isinstance(form_node, dict):
+        class_name = form_node.get("class", "")
+    elif isinstance(form_node, ak.forms.Form):
+        class_name = type(form_node).__name__
+    else:
+        return branches
+
+    # --- NumpyArray leaf → its form_key is the branch name ---------------
+    if class_name == "NumpyArray" or isinstance(form_node, ak.forms.NumpyForm):
+        fk = form_node.get("form_key") if isinstance(form_node, dict) else form_node.form_key
+        if fk:
+            branch = _form_key_to_branch(fk)
+            if branch:
+                branches.add(branch)
+        return branches
+
+    # --- RecordArray → iterate children ----------------------------------
+    if class_name == "RecordArray" or isinstance(form_node, ak.forms.RecordForm):
+        if isinstance(form_node, dict):
+            children = form_node.get("contents", {})
+            if isinstance(children, dict):
+                children = children.values()
+            for child_form in children:
+                branches |= _collect_form_branches(child_form, prefix)
+        else:
+            for child_form in form_node.contents:
+                branches |= _collect_form_branches(child_form, prefix)
+        return branches
+
+    # --- ListOffsetArray → recurse into content --------------------------
+    if class_name == "ListOffsetArray" or isinstance(form_node, ak.forms.ListOffsetForm):
+        if isinstance(form_node, dict):
+            content = form_node.get("content", {})
+        else:
+            content = form_node.content
+        branches |= _collect_form_branches(content, prefix)
+        return branches
+
+    # --- Unknown / other -------------------------------------------------
+    return branches
+
+
+def _form_key_to_branch(form_key):
+    """Return the NanoAOD branch encoded in a form or buffer key."""
+    elements = _unquote(str(form_key).split("/")[-1]).split(",")
+    for idx, instr in enumerate(elements):
+        if instr == "!load" and idx > 0:
+            return elements[idx - 1]
+
+    branch = elements[0] if elements else ""
+    if branch and "!" not in branch:
+        return branch
+    return None
+
+
+def _pocket_coffea_form_keys_to_columns(touched):
+    """
+    Fixed version of _form_keys_to_columns that handles the NanoEventsFactory
+    buffer-key format in addition to the DSL format with ``!load`` markers.
+
+    NanoEventsFactory produces buffer keys of the form::
+
+        {attribute}/{form_key}
+
+    where the *form_key* IS the branch name (e.g. ``data/Electron_pt``,
+    ``data/Jet.pt``, ``offsets/Jet,!offsets``).
+
+    The original coffea implementation only parses DSL-style keys that embed
+    ``!load`` instructions.  This drop-in replacement tries the original logic
+    first and falls back to extracting the form_key directly when no ``!load``
+    marker is found.
+    """
+    keys = set(_original_form_keys_to_columns(touched))
+    if keys:
+        return frozenset(keys)
+
+    for _buffer_key in touched:
+        elements = _unquote(str(_buffer_key).split("/")[-1]).split(",")
+        found = {elements[idx - 1] for idx, instr in enumerate(elements) if instr == "!load"}
+        if found:
+            keys |= found
+        else:
+            branch = _form_key_to_branch(_buffer_key)
+            if branch:
+                keys.add(branch)
+
+    return frozenset(keys)
+
+
+def _enrich_trace_metadata(fun, events):
+    """Add PocketCoffea dataset metadata missing from Coffea's trace events."""
+    metadata = getattr(events, "metadata", None)
+    dataset = metadata.get("dataset") if isinstance(metadata, dict) else None
+    processor = getattr(fun, "__self__", None)
+    cfg = getattr(processor, "cfg", None)
+    filesets = getattr(cfg, "filesets", {}) if cfg is not None else {}
+
+    if not dataset or dataset not in filesets or not isinstance(metadata, dict):
+        return
+
+    dataset_metadata = filesets[dataset].get("metadata", {})
+    for key, value in dataset_metadata.items():
+        metadata.setdefault(key, value)
+
+
+# ---------------------------------------------------------------------------
+# Custom branch tracing — more robust than the built-in coffea version
+# ---------------------------------------------------------------------------
+def traced_branch_printer(fun, events, throw=False):
+    """
+    Determine which NanoAOD branches are needed by *fun* (the processor's
+    ``process`` method) and print / return them.
+
+    The built-in ``coffea.nanoevents.trace.trace`` is tried first — it uses
+    typetracer, then length‑zero, then length‑one arrays, and suffers from
+    two problems that can cause it to return *zero* branches:
+
+    1. ``len(events)`` raises on a typetracer array, so the typetracer
+       attempt always fails.
+    2. ``_make_length_zero_one_tracer`` can raise an assertion when the
+       NanoEvents form contains certain nested structures, causing all
+       fallback methods to fail as well.
+
+    When the built-in trace returns zero branches this function falls back
+    to extracting branch names directly from the event *form* — every leaf
+    ``NumpyArray`` in the form has a *form_key* that is the NanoAOD branch
+    name.
+    """
+    import coffea.nanoevents.trace as _ctrace
+
+    _enrich_trace_metadata(fun, events)
+
+    # --- First attempt: the built-in trace (with our fixed column parser) --
+    _orig_fn = _ctrace._form_keys_to_columns
+    _ctrace._form_keys_to_columns = _pocket_coffea_form_keys_to_columns
+
+    _t0 = time.time()
+    try:
+        result = coffea_trace(fun, events)
+    except Exception:
+        # The built-in trace can raise even after exhausting all three
+        # methods (e.g. when all three fail).  In that case we ignore the
+        # exception and fall through to the form-based approach.
+        result = frozenset()
+    finally:
+        _ctrace._form_keys_to_columns = _orig_fn
+
+    # --- First attempt directly with length‑zero tracer (bypass typetracer) -
+    if len(result) == 0:
+        try:
+            tracer, report = _ctrace._make_length_zero_one_tracer(events, length=0)
+            _ctrace._attempt_tracing(fun, tracer, throw=True)
+            result = _pocket_coffea_form_keys_to_columns(report)
+        except Exception:
+            result = frozenset()
+
+    # --- Length‑one fallback ------------------------------------------------
+    if len(result) == 0:
+        try:
+            tracer, report = _ctrace._make_length_zero_one_tracer(events, length=1)
+            _ctrace._attempt_tracing(fun, tracer, throw=True)
+            result = _pocket_coffea_form_keys_to_columns(report)
+        except Exception:
+            result = frozenset()
+
+    # --- Ultimate fallback: extract from the form --------------------------
+    if len(result) == 0:
+        print("[TRACE] Coffea built-in trace returned 0 branches — "
+              "falling back to form-based branch extraction.")
+        form_dict = events.attrs.get("@form", {})
+        result = frozenset(_collect_form_branches(form_dict))
+        print(f"[TRACE] Form-based extraction found {len(result)} potential branches.")
+
+    _t1 = time.time()
+    branches = sorted(result)
+    print(f"[TRACE] Branch tracing completed in {_t1-_t0:.3f}s")
+    print(f"[TRACE] Number of branches identified as needed: {len(branches)}")
+    if branches:
+        print(f"[TRACE] Branches needed:")
+        for i, b in enumerate(branches):
+            print(f"  [{i:4d}] {b}")
+    return result
+
+
+trace = traced_branch_printer
 
 from pocket_coffea.utils.configurator import Configurator
 from pocket_coffea.utils.utils import load_config, path_import, adapt_chunksize, save_failed_jobs, load_failed_jobs, FAILED_JOBS_FILENAME
@@ -71,8 +285,20 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
            filter_years, filter_samples, filter_datasets, resubmit_failed,
            blocklist_sites, recreate_queue, use_redirector, skip_bad_files):
     '''Run an analysis on NanoAOD files using PocketCoffea processors'''
-    # Setting up the output dir
-    os.makedirs(outputdir, exist_ok=True)
+    # Setting up the output dir. For remote xrootd destinations (root://...),
+    # create the directory on the remote host via xrdfs instead of trying to
+    # makedirs() locally — the submit host may not have the /eos/ tree mounted
+    # (or may not have write access to it), and xrdcp/xrdfs is the only
+    # universally supported way to interact with EOS.
+    if outputdir.startswith("root://"):
+        remainder = outputdir[len("root://"):]
+        host, remote_path = remainder.split("/", 1)
+        subprocess.run(
+            ["xrdfs", host, "mkdir", "-p", "/" + remote_path],
+            check=True,
+        )
+    else:
+        os.makedirs(outputdir, exist_ok=True)
     outfile = os.path.join(
         outputdir, "output_{}.coffea"
     )
@@ -88,9 +314,12 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         exit(1)
 
     rprint("[bold]Loading the configuration file...[/]")
+    _t0 = time.time()
     if cfg[-3:] == ".py":
         # Load the script
         config = load_config(cfg, save_config=True, outputdir=outputdir)
+        _t1 = time.time()
+        print(f"[TIMING] load_config (.py): {_t1-_t0:.2f}s")
     elif cfg[-4:] == ".pkl":
         config = cloudpickle.load(open(cfg,"rb"))
         if not config.loaded:
@@ -214,6 +443,8 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         from pocket_coffea.executors import executors_brux as executors_lib
     elif site == "rubin":
         from pocket_coffea.executors import executors_rubin as executors_lib
+    elif site == "cmsconnect":
+        from pocket_coffea.executors import executors_cmsconnect as executors_lib
     elif site == "oscar":
         from pocket_coffea.executors import executors_oscar as executors_lib
     elif site == "casa":
@@ -271,12 +502,19 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         # Note: we will filter filesets_groups later after groups are constructed
         # since failed jobs refer to group names, not individual dataset names
 
+    print(f"[TIMING] Config loaded, datasets to process: {len(filesets_to_run)}")
+    for ds_name, ds_info in filesets_to_run.items():
+        nf = len(ds_info["files"])
+        nev = ds_info["metadata"]["nevents"]
+        print(f"  [TRACE] Dataset: {ds_name}, files={nf}, events={nev}, sample={ds_info['metadata']['sample']}, year={ds_info['metadata']['year']}")
+
     if len(filesets_to_run) == 0:
         print("No datasets to process, closing")
         exit(1)
 
         
     # Instantiate the executor
+    _t_exec_setup = time.time()
     
     # Checking if the executor handles the submission or returns a coffea executor
     if executor_factory.handles_submission:
@@ -286,6 +524,10 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     else:
         executor = executor_factory.get()
 
+    _t_exec_ready = time.time()
+    print(f"[TIMING] Executor setup & instantiation: {_t_exec_ready-_t_exec_setup:.2f}s")
+    print(f"[TRACE] Executor type: {type(executor).__name__}")
+    print(f"[TRACE] Run options: chunksize={run_options.get('chunksize')}, limit-chunks={run_options.get('limit-chunks')}, scaleout={run_options.get('scaleout')}")
 
     start_time = time.time()
         
@@ -312,14 +554,21 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
             exit_on_error=True
         )
 
+        _t_run_start = time.time()
         output = run(filesets_to_run, treename="Events",
-                     processor_instance=config.processor_instance)
+                     processor_instance=config.processor_instance,
+                     trace=trace)
+        _t_run_end = time.time()
+        print(f"[TIMING] Processing all datasets together: {_t_run_end-_t_run_start:.2f}s")
         
         print(f"Saving output to {outfile.format('all')}")
+        _t_save = time.time()
         save(output, outfile.format("all") )
+        print(f"[TIMING] Saving output: {time.time()-_t_save:.2f}s")
         print_processing_stats(output, start_time, run_options["scaleout"])
 
     else:
+        _t_group = time.time()
         if run_options["group-samples"] is not None:
             logging.info(f"Grouping samples during processing")
             logging.info(f"Grouping samples configuration: {run_options['group-samples']}")
@@ -339,6 +588,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                 filesets_groups[dataset] = {dataset:files}
 
             print("All datasets to process:", filesets_groups.keys())
+            print(f"[TIMING] Grouping datasets: {time.time()-_t_group:.2f}s")
         else:
             filesets_groups = {dataset:{dataset:files} for dataset, files in filesets_to_run.items()}
 
@@ -354,15 +604,16 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         failed_jobs_list = []
 
         # Running separately on each dataset
-        for group_name, fileset_ in filesets_groups.items():
+        n_groups = len(filesets_groups)
+        for i_group, (group_name, fileset_) in enumerate(filesets_groups.items()):
             dataset_start_time = time.time()
             datasets = list(fileset_.keys())
             if len(datasets) == 1:
                 dataset = datasets[0]
-                print(f"Working on dataset: {group_name}")
+                print(f"[TIMING] Processing group {i_group+1}/{n_groups}: {group_name} (dataset: {dataset})")
                 logging.info(f"Working on dataset: {group_name}")
             else:
-                print(f"Working on group of datasets: {group_name} ({len(datasets)} datasets)")
+                print(f"[TIMING] Processing group {i_group+1}/{n_groups}: {group_name} ({len(datasets)} datasets)")
                 logging.info(f"Working on group of datasets: {group_name} ({len(datasets)} datasets)")
 
             n_events_tot = sum([int(files["metadata"]["nevents"]) for files in fileset_.values()])
@@ -373,6 +624,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                 logging.info(f"Reducing chunksize from {run_options['chunksize']} to {adapted_chunksize} for dataset(s) {group_name}")
 
             # Get the coffea Runner wrapped with error logging
+            _t_get_runner = time.time()
             run = get_runner(
                 executor=executor,
                 chunksize=run_options["chunksize"],
@@ -383,16 +635,24 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                 error_log_file=f"{outputdir}/error/run_{group_name}.err",
                 exit_on_error=False # Continue to next dataset on error
             )
+            print(f"[TIMING] get_runner: {time.time()-_t_get_runner:.2f}s")
 
+            _t_run_start = time.time()
             output = run(fileset_, treename="Events",
-                         processor_instance=config.processor_instance)
+                         processor_instance=config.processor_instance,
+                         trace=trace)
+            _t_run_end = time.time()
+            print(f"[TIMING] Coffea Runner processing for {group_name}: {_t_run_end-_t_run_start:.2f}s")
+            
             if output is None:
                 logging.error(f"Processing of dataset {group_name} failed, moving to the next one")
                 failed_jobs_list.append(group_name)
                 continue
             else:
+                _t_save = time.time()
                 print(f"Saving output to {outfile.format(group_name)}")
                 save(output, outfile.format(group_name))
+                print(f"[TIMING] Saving output for {group_name}: {time.time()-_t_save:.2f}s")
                 print_processing_stats(output, dataset_start_time, run_options["scaleout"])
 
         # Save the list of failed jobs
@@ -409,7 +669,14 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         save_skimed_dataset_definition(output, f"{outputdir}/skimmed_dataset_definition.json", check_initial_events=not test)
         
     # Closing the executor if needed
+    _t_close = time.time()
     executor_factory.close()
+    print(f"[TIMING] Executor close: {time.time()-_t_close:.2f}s")
+    
+    total_elapsed = time.time() - start_time
+    print(f"[TIMING] ========================================")
+    print(f"[TIMING] TOTAL RUN TIME: {total_elapsed:.2f}s ({total_elapsed/60.:.2f} minutes)")
+    print(f"[TIMING] ========================================")
 
 
 
