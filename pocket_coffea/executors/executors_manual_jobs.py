@@ -15,6 +15,7 @@ from math import ceil
 # (HTCondor scheduling, job sizing, orchestration) and intentionally NOT
 # propagated through the wrapper.
 INNER_RUN_OPTIONS_WHITELIST = (
+    "limit-chunks",
     "skip-bad-files",
     "tree-reduction",
 )
@@ -149,7 +150,7 @@ class ExecutorFactoryManualABC(ABC):
 
     def setup_proxyfile(self):
         if self.run_options['ignore-grid-certificate']: return
-        if vomsproxy:=self.run_options.get('voms-proxy', None) is not None:
+        if (vomsproxy := self.run_options.get('voms-proxy', None)) is not None:
              self.x509_path = vomsproxy
         else:
              _x509_localpath = get_proxy_path()

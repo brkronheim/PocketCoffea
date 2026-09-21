@@ -1,15 +1,13 @@
-"""Print a human-readable summary of a per-job pickle produced by the
-manual-jobs executors (`condor@lxplus`, `condor@rubin`, ...).
+"""Print a human-readable summary of a manual-executor job configuration.
 
-Each `jobs_dir/config_job_{i}.pkl` is a cloudpickled `Configurator` whose
-`filesets` have been restricted to one job's slice. This tool loads the
-pickle and prints what the job will actually run on: workflow class,
-workflow options, save_skimmed_files setting, and the per-dataset table
-(sample, year, isMC, n_files, n_events). Pass --files to also list every
-file URL.
+Legacy manual executors produce a cloudpickled `Configurator` per job.
+`condor@cmsconnect` produces a YAML descriptor that references one shared
+configurator pickle and a compact per-job fileset YAML. This tool accepts
+both formats and prints what the job will actually run on.
 
 Typical use:
     pocket-coffea inspect-job /path/to/jobs_dir/job/config_job_42.pkl
+    pocket-coffea inspect-job /path/to/cmsconnect_jobs/job/config_job_42.yaml
     pocket-coffea inspect-job .../config_job_42.pkl --files
 """
 import os
@@ -20,24 +18,31 @@ from rich import print as rprint
 from rich.table import Table
 from rich.console import Console
 
+from pocket_coffea.utils.utils import load_job_config
+
 
 @click.command(name="inspect-job")
-@click.argument("pickle_path", type=click.Path(exists=True, dir_okay=False))
+@click.argument("config_path", type=click.Path(exists=True, dir_okay=False))
 @click.option("-f", "--files", "show_files", is_flag=True,
               help="List every file URL per dataset.")
 @click.option("-m", "--metadata", "show_metadata", is_flag=True,
               help="Print the full per-dataset metadata dict (verbose).")
 @click.option("--workflow-options/--no-workflow-options", default=True,
               help="Print the workflow_options dict (default: on).")
-def inspect_job(pickle_path, show_files, show_metadata, workflow_options):
-    """Print the content of a per-job pickle (jobs_dir/config_job_*.pkl)."""
+def inspect_job(config_path, show_files, show_metadata, workflow_options):
+    """Print a per-job .pkl or CMS Connect YAML descriptor."""
     console = Console()
 
-    with open(pickle_path, "rb") as f:
-        cfg = cloudpickle.load(f)
+    if config_path.endswith((".yaml", ".yml")):
+        cfg = load_job_config(config_path)
+        config_label = "Job descriptor"
+    else:
+        with open(config_path, "rb") as f:
+            cfg = cloudpickle.load(f)
+        config_label = "Job pickle"
 
     # --- header
-    rprint(f"[bold]Job pickle:[/] {os.path.abspath(pickle_path)}")
+    rprint(f"[bold]{config_label}:[/] {os.path.abspath(config_path)}")
     workflow = getattr(cfg, "workflow", None)
     wf_name = getattr(workflow, "__name__", str(workflow))
     wf_mod = getattr(workflow, "__module__", "")

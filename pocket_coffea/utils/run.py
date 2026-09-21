@@ -3,14 +3,27 @@ import logging
 from functools import partial
 from coffea.processor import Runner
 from coffea.nanoevents.mapping import BufferCache
+from numcodecs import Blosc
+from zict import LRU
 
 from pocket_coffea.utils.logging import try_and_log_error
 
-# Shared in-memory buffer cache across all chunks.
-# Avoids re-reading and re-decompressing branches from the ROOT file on every access.
-# Without this, the lazy virtual arrays in Coffea 2026+ re-materialize from disk
-# every time a branch is touched after a copy/deepcopy (ak.copy -> copy.deepcopy).
-_shared_buffer_cache = BufferCache(cache=None, codec=None)
+# Shared compressed in-memory buffer cache across all chunks. The LRU weight is
+# based on compressed bytes, so the limit bounds the cache's actual RAM payload.
+
+_buffer_cache_capacity = int(
+    os.environ.get("POCKET_COFFEA_BUFFER_CACHE_BYTES", 500 * 1024**2)
+)
+_buffer_cache_storage = LRU(
+    n=_buffer_cache_capacity,
+    d={},
+    weight=lambda key, value: len(value),
+)
+_shared_buffer_cache = BufferCache(
+    cache=_buffer_cache_storage,
+    codec=Blosc("zstd", clevel=1, shuffle=Blosc.BITSHUFFLE),
+)
+
 
 
 def get_runner(executor, chunksize, maxchunks, skipbadfiles, schema, format, error_log_file, exit_on_error=True):
@@ -41,9 +54,10 @@ def get_runner(executor, chunksize, maxchunks, skipbadfiles, schema, format, err
         A Coffea Runner instance configured with the specified parameters.
     """
 
-    # Use a shared in-memory buffer cache so decompressed branch data survives
-    # across chunk boundaries and repeated materializations (ak.copy / deepcopy).
-    # The callable returns the *same* cache every time, so caching works across chunks.
+    # Use the shared compressed buffer cache so branch data survives repeated
+    # materializations (ak.copy / deepcopy) without retaining raw buffers.
+    # The callable returns the same cache every time, so entries are shared
+    # across chunks in the same process.
     cachestrategy = lambda: _shared_buffer_cache
 
     # Create and return the Runner wrapped with error logging

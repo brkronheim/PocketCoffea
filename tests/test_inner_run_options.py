@@ -24,6 +24,7 @@ from pocket_coffea.executors.executors_manual_jobs import (
 
 def test_write_keeps_only_whitelisted_keys(tmp_path):
     run_options = {
+        "limit-chunks": 2,
         "skip-bad-files": True,
         "tree-reduction": 4,
         # Outer-only keys must NOT be propagated
@@ -39,7 +40,7 @@ def test_write_keeps_only_whitelisted_keys(tmp_path):
     with open(path) as f:
         # Skip the comment header
         loaded = yaml.safe_load(f.read())
-    assert loaded == {"skip-bad-files": True, "tree-reduction": 4}
+    assert loaded == {"limit-chunks": 2, "skip-bad-files": True, "tree-reduction": 4}
     # Outer-only keys are absent
     for forbidden in ("cores-per-worker", "mem-per-worker", "worker-image", "queue", "chunksize"):
         assert forbidden not in loaded
@@ -64,7 +65,7 @@ def test_write_empty_when_nothing_whitelisted(tmp_path):
 
 def test_whitelist_is_expected_set():
     """Pin the whitelist so future widening is intentional."""
-    assert set(INNER_RUN_OPTIONS_WHITELIST) == {"skip-bad-files", "tree-reduction"}
+    assert set(INNER_RUN_OPTIONS_WHITELIST) == {"limit-chunks", "skip-bad-files", "tree-reduction"}
 
 
 # ----------------------- ensure_job_sh_forwards_inner_yaml -----------------------

@@ -6,6 +6,7 @@ import cloudpickle
 import socket
 import logging
 import yaml
+from urllib.parse import urlparse
 from yaml import Loader, Dumper
 import click
 import time
@@ -24,6 +25,37 @@ from coffea.nanoevents.trace import (
 from coffea.nanoevents.util import unquote as _unquote
 
 import awkward as ak
+from coffea import processor
+
+
+class _ProfiledProcessor(processor.ProcessorABC):
+    def __init__(self, processor_instance):
+        self._processor_instance = processor_instance
+
+    def process(self, events):
+        return profile_call(
+            self._processor_instance.process,
+            events,
+            output_dir=os.environ.get(
+                "POCKET_COFFEA_PROFILE_DIR", "profiling/process_profiles"
+            ),
+            file_prefix="process",
+        )
+
+    def postprocess(self, accumulator):
+        return self._processor_instance.postprocess(accumulator)
+
+    def __getattr__(self, name):
+        processor_instance = self.__dict__.get("_processor_instance")
+        if processor_instance is None:
+            raise AttributeError(name)
+        return getattr(processor_instance, name)
+
+
+def _get_processor_instance(processor_instance):
+    if os.environ.get("POCKET_COFFEA_PROFILE_PROCESS") == "1":
+        return _ProfiledProcessor(processor_instance)
+    return processor_instance
 
 
 # ---------------------------------------------------------------------------
@@ -148,6 +180,89 @@ def _enrich_trace_metadata(fun, events):
         metadata.setdefault(key, value)
 
 
+def _trace_process_without_filtering(fun):
+    """Return a process callable that keeps one synthetic event alive.
+
+    PocketCoffea's process method returns when a skim or preselection leaves no
+    events. That is correct for real processing, but a length-one trace array
+    contains placeholder values and commonly fails those masks. Re-running
+    the filter methods while restoring their input lets tracing reach the
+    downstream processing stages.
+    """
+    processor = getattr(fun, "__self__", None)
+    if processor is None or getattr(fun, "__name__", None) != "process":
+        return fun
+
+    def trace_process(events):
+        original_skim_events = processor.skim_events
+        original_apply_preselections = processor.apply_preselections
+
+        def trace_skim_events():
+            events_before_skim = processor.events
+            try:
+                original_skim_events()
+            except Exception:
+                pass
+            processor.events = events_before_skim
+            processor.nEvents_after_skim = len(events_before_skim)
+            processor.has_events = True
+
+        def trace_apply_preselections(variation):
+            events_before_presel = processor.events
+            try:
+                original_apply_preselections(variation)
+            except Exception:
+                pass
+            processor.events = events_before_presel
+            processor.nEvents_after_presel = len(events_before_presel)
+            processor.has_events = True
+
+        missing = object()
+        saved_instance_attributes = {}
+        for name, value in (
+            ("skim_events", trace_skim_events),
+            ("apply_preselections", trace_apply_preselections),
+        ):
+            saved_instance_attributes[name] = processor.__dict__.get(name, missing)
+            setattr(processor, name, value)
+
+        saved_workflow_options = processor.workflow_options
+        if isinstance(saved_workflow_options, dict):
+            processor.workflow_options = {
+                key: value
+                for key, value in saved_workflow_options.items()
+                if key != "dump_columns_as_arrays_per_chunk"
+            }
+
+        config = getattr(processor, "cfg", None)
+        saved_save_skimmed_files = getattr(config, "save_skimmed_files", None)
+        if config is not None and saved_save_skimmed_files:
+            config.save_skimmed_files = False
+
+        try:
+            return fun(events)
+        finally:
+            processor.workflow_options = saved_workflow_options
+            if config is not None and saved_save_skimmed_files is not None:
+                config.save_skimmed_files = saved_save_skimmed_files
+            for name, old_value in saved_instance_attributes.items():
+                if old_value is missing:
+                    processor.__dict__.pop(name, None)
+                else:
+                    setattr(processor, name, old_value)
+
+    return trace_process
+
+
+def _run_without_phase_profiling(function, *args, **kwargs):
+    saved_profile_flag = os.environ.pop("POCKET_COFFEA_PROFILE_PHASES", None)
+    try:
+        return function(*args, **kwargs)
+    finally:
+        if saved_profile_flag is not None:
+            os.environ["POCKET_COFFEA_PROFILE_PHASES"] = saved_profile_flag
+
+
 # ---------------------------------------------------------------------------
 # Custom branch tracing — more robust than the built-in coffea version
 # ---------------------------------------------------------------------------
@@ -175,45 +290,46 @@ def traced_branch_printer(fun, events, throw=False):
 
     _enrich_trace_metadata(fun, events)
 
-    # --- First attempt: the built-in trace (with our fixed column parser) --
+    # --- Try every available tracing pass and union their reports. Coffea's
+    # trace() returns after the first successful pass, which can be the
+    # length-zero pass that exits PocketCoffea at the skim stage.
     _orig_fn = _ctrace._form_keys_to_columns
     _ctrace._form_keys_to_columns = _pocket_coffea_form_keys_to_columns
 
     _t0 = time.time()
+    result = set()
     try:
-        result = coffea_trace(fun, events)
+        result.update(_run_without_phase_profiling(coffea_trace, fun, events))
     except Exception:
-        # The built-in trace can raise even after exhausting all three
-        # methods (e.g. when all three fail).  In that case we ignore the
-        # exception and fall through to the form-based approach.
-        result = frozenset()
+        if throw:
+            raise
     finally:
         _ctrace._form_keys_to_columns = _orig_fn
 
-    # --- First attempt directly with length‑zero tracer (bypass typetracer) -
-    if len(result) == 0:
+    # --- Repeat the explicit length-zero and length-one passes even when an
+    # earlier pass found branches. The length-one pass uses a trace-only
+    # wrapper so the main processing section is reachable.
+    trace_fun = _trace_process_without_filtering(fun)
+    for length, callable_ in ((0, fun), (1, trace_fun)):
+        report = None
         try:
-            tracer, report = _ctrace._make_length_zero_one_tracer(events, length=0)
-            _ctrace._attempt_tracing(fun, tracer, throw=True)
-            result = _pocket_coffea_form_keys_to_columns(report)
+            tracer, report = _ctrace._make_length_zero_one_tracer(events, length=length)
+            _run_without_phase_profiling(
+                _ctrace._attempt_tracing, callable_, tracer, throw=True
+            )
         except Exception:
-            result = frozenset()
-
-    # --- Length‑one fallback ------------------------------------------------
-    if len(result) == 0:
-        try:
-            tracer, report = _ctrace._make_length_zero_one_tracer(events, length=1)
-            _ctrace._attempt_tracing(fun, tracer, throw=True)
-            result = _pocket_coffea_form_keys_to_columns(report)
-        except Exception:
-            result = frozenset()
+            if throw:
+                raise
+        finally:
+            if report is not None:
+                result.update(_pocket_coffea_form_keys_to_columns(report))
 
     # --- Ultimate fallback: extract from the form --------------------------
     if len(result) == 0:
         print("[TRACE] Coffea built-in trace returned 0 branches — "
               "falling back to form-based branch extraction.")
         form_dict = events.attrs.get("@form", {})
-        result = frozenset(_collect_form_branches(form_dict))
+        result.update(_collect_form_branches(form_dict))
         print(f"[TRACE] Form-based extraction found {len(result)} potential branches.")
 
     _t1 = time.time()
@@ -230,13 +346,40 @@ def traced_branch_printer(fun, events, throw=False):
 trace = traced_branch_printer
 
 from pocket_coffea.utils.configurator import Configurator
-from pocket_coffea.utils.utils import load_config, path_import, adapt_chunksize, save_failed_jobs, load_failed_jobs, FAILED_JOBS_FILENAME
+from pocket_coffea.utils.utils import load_config, load_job_config, path_import, adapt_chunksize, save_failed_jobs, load_failed_jobs, FAILED_JOBS_FILENAME
 from pocket_coffea.utils.logging import setup_logging, try_and_log_error
 from pocket_coffea.utils.run import get_runner
 from pocket_coffea.utils.time import wait_until
 from pocket_coffea.parameters import defaults as parameters_utils
 from pocket_coffea.executors import executors_base, executors_manual_jobs
 from pocket_coffea.utils.benchmarking import print_processing_stats
+from pocket_coffea.utils.profiling import profile_call
+
+
+def _prepare_runner_outputdir(outputdir, executor):
+    if not outputdir.startswith("root://"):
+        os.makedirs(outputdir, exist_ok=True)
+        return outputdir
+
+    site = executor.split("@", 1)[1] if "@" in executor else None
+    if site != "cmsconnect":
+        raise ValueError("A root:// output directory is only supported by condor@cmsconnect")
+
+    parsed = urlparse(outputdir)
+    if not parsed.netloc or not parsed.path.lstrip("/"):
+        raise ValueError(f"Incomplete XRootD output directory: {outputdir!r}")
+    subprocess.run(
+        ["xrdfs", parsed.netloc, "mkdir", "-p", "/" + parsed.path.lstrip("/")],
+        check=True,
+    )
+
+    from pocket_coffea.executors.executors_cmsconnect import (
+        _local_cmsconnect_submission_dir,
+    )
+
+    local_outputdir = _local_cmsconnect_submission_dir(outputdir)
+    os.makedirs(local_outputdir, exist_ok=True)
+    return local_outputdir
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.option('--cfg', required=True, type=str,
@@ -266,10 +409,10 @@ from pocket_coffea.utils.benchmarking import print_processing_stats
                    "rewrite each resubmitted job's +JobFlavour to this HTCondor queue "
                    "(e.g. espresso, microcentury, longlunch, workday, tomorrow, testmatch, nextweek). "
                    "Overrides the implicit timeout-bump for running jobs.")
-@click.option("--use-redirector", is_flag=True, default=False,
+@click.option("--use-redirector/--no-use-redirector", default=None,
               help="When used together with --recreate-jobs on a manual-jobs executor, "
                    "rewrite every file in every resubmitted job to use the global xrootd "
-                   "redirector (root://xrootd-cms.infn.it//), skipping per-site Rucio lookups. "
+                   "redirector (root://cms-xrd-global.cern.ch//), skipping per-site Rucio lookups. "
                    "Useful when many sites are flaky and you want xrootd to figure out routing.")
 @click.option("--skip-bad-files", is_flag=True, default=False,
               help="Tell Coffea's Runner to skip files that fail to open (xrootd timeout, "
@@ -285,24 +428,11 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
            filter_years, filter_samples, filter_datasets, resubmit_failed,
            blocklist_sites, recreate_queue, use_redirector, skip_bad_files):
     '''Run an analysis on NanoAOD files using PocketCoffea processors'''
-    # Setting up the output dir. For remote xrootd destinations (root://...),
-    # create the directory on the remote host via xrdfs instead of trying to
-    # makedirs() locally — the submit host may not have the /eos/ tree mounted
-    # (or may not have write access to it), and xrdcp/xrdfs is the only
-    # universally supported way to interact with EOS.
-    if outputdir.startswith("root://"):
-        remainder = outputdir[len("root://"):]
-        host, remote_path = remainder.split("/", 1)
-        subprocess.run(
-            ["xrdfs", host, "mkdir", "-p", "/" + remote_path],
-            check=True,
-        )
-    else:
-        os.makedirs(outputdir, exist_ok=True)
+    runner_outputdir = _prepare_runner_outputdir(outputdir, executor)
     outfile = os.path.join(
-        outputdir, "output_{}.coffea"
+        runner_outputdir, "output_{}.coffea"
     )
-    logfile = os.path.join(outputdir, "logfile.log")
+    logfile = os.path.join(runner_outputdir, "logfile.log")
     
     # Store loaded failed jobs for reuse
     failed_jobs_to_resubmit = None
@@ -317,17 +447,23 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     _t0 = time.time()
     if cfg[-3:] == ".py":
         # Load the script
-        config = load_config(cfg, save_config=True, outputdir=outputdir)
+        config = load_config(cfg, save_config=True, outputdir=runner_outputdir)
         _t1 = time.time()
         print(f"[TIMING] load_config (.py): {_t1-_t0:.2f}s")
     elif cfg[-4:] == ".pkl":
         config = cloudpickle.load(open(cfg,"rb"))
         if not config.loaded:
             config.load()
-        config.save_config(outputdir)
+        config.save_config(runner_outputdir)
+        rprint("[italic]The configuration file is saved at {outputdir} [/]")
+    elif cfg.endswith((".yaml", ".yml")):
+        config = load_job_config(cfg)
+        if not config.loaded:
+            config.load()
+        config.save_config(runner_outputdir)
         rprint("[italic]The configuration file is saved at {outputdir} [/]")
     else:
-        raise sys.exit("Please provide a .py/.pkl configuration file")
+        raise sys.exit("Please provide a .py/.pkl configuration file or a YAML job descriptor")
 
     print(config)
     
@@ -377,8 +513,8 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     if recreate_queue is not None:
         run_options["recreate-queue"] = recreate_queue
 
-    if use_redirector:
-        run_options["use-redirector"] = True
+    if use_redirector is not None:
+        run_options["use-redirector"] = use_redirector
 
     if skip_bad_files:
         run_options["skip-bad-files"] = True
@@ -528,6 +664,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     print(f"[TIMING] Executor setup & instantiation: {_t_exec_ready-_t_exec_setup:.2f}s")
     print(f"[TRACE] Executor type: {type(executor).__name__}")
     print(f"[TRACE] Run options: chunksize={run_options.get('chunksize')}, limit-chunks={run_options.get('limit-chunks')}, scaleout={run_options.get('scaleout')}")
+    processor_instance = _get_processor_instance(config.processor_instance)
 
     start_time = time.time()
         
@@ -556,7 +693,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
 
         _t_run_start = time.time()
         output = run(filesets_to_run, treename="Events",
-                     processor_instance=config.processor_instance,
+                     processor_instance=processor_instance,
                      trace=trace)
         _t_run_end = time.time()
         print(f"[TIMING] Processing all datasets together: {_t_run_end-_t_run_start:.2f}s")
@@ -639,7 +776,7 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
 
             _t_run_start = time.time()
             output = run(fileset_, treename="Events",
-                         processor_instance=config.processor_instance,
+                         processor_instance=processor_instance,
                          trace=trace)
             _t_run_end = time.time()
             print(f"[TIMING] Coffea Runner processing for {group_name}: {_t_run_end-_t_run_start:.2f}s")

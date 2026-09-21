@@ -8,6 +8,7 @@ import requests
 from rucio.client import Client
 from rucio.common.client import detect_client_location
 from pocket_coffea.utils.network import get_proxy_path
+from pocket_coffea.utils.site_rewrite import GLOBAL_XROOTD_REDIRECTOR
 
 # Rucio needs the default configuration --> taken from CMS cvmfs defaults
 if "RUCIO_HOME" not in os.environ:
@@ -276,7 +277,7 @@ def get_dataset_files_replicas(
             if len(list(rses.keys())) != 0:
                 # Only makes sense if the file exists at least somewhere
                 outfile.append(
-                    _get_pfn_for_site(filedata["name"], "root://xrootd-cms.infn.it//")
+                    _get_pfn_for_site(filedata["name"], GLOBAL_XROOTD_REDIRECTOR)
                 )
                 outsite.append('INFN')
                 print("\t WARNING! The file was NOT found at any of the allowed sites. Setting its prefix to INFN! \n ", outfile)

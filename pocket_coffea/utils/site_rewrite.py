@@ -17,7 +17,7 @@ monkey-patch `_query_replicas` directly).
 from copy import deepcopy
 
 
-GLOBAL_XROOTD_REDIRECTOR = "root://xrootd-cms.infn.it//"
+GLOBAL_XROOTD_REDIRECTOR = "root://cms-xrd-global.cern.ch//"
 
 
 def _split_lfn(filepath):

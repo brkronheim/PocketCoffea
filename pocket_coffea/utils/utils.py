@@ -7,11 +7,16 @@ from typing import List, Optional
 import awkward
 import pathlib
 from .configurator import Configurator
+from .metadata import to_bool
 import hashlib
 from numba import njit
 import awkward as ak
 import json
 import logging
+from collections.abc import Mapping
+
+import cloudpickle
+import yaml
 
 # Constant for the failed jobs filename
 FAILED_JOBS_FILENAME = "failed_jobs.json"
@@ -81,22 +86,70 @@ def load_config(cfg, do_load=True, save_config=True, outputdir=None):
     print(f"[TIMING] path_import: {time.time()-_t0:.2f}s")
     try:
         config = config_module.cfg
-        # Load the configuration
-        if do_load:
-            print(f"[TIMING] Starting Configurator.load()...")
-            _t1 = time.time()
-            config.load()
-            print(f"[TIMING] Configurator.load(): {time.time()-_t1:.2f}s")
-        if save_config and outputdir is not None:
-            _t2 = time.time()
-            config.save_config(outputdir)
-            print(f"[TIMING] save_config: {time.time()-_t2:.2f}s")
     except AttributeError as e:
         print("Error: ", e)
         raise Exception("The provided configuration module does not contain a `cfg` attribute of type Configurator. Please check your configuration!")
 
     if not isinstance(config, Configurator):
-        raise Exception("The configuration module attribute `cfg` is not of type Configurator. Please check yuor configuration!")
+        raise Exception("The configuration module attribute `cfg` is not of type Configurator. Please check your configuration!")
+
+    # Load/save the configuration OUTSIDE the AttributeError guard above: a
+    # genuine AttributeError raised inside config.load() is a real bug in the
+    # user's config and must surface with its own traceback, not be masked as a
+    # missing `cfg` attribute.
+    if do_load:
+        print(f"[TIMING] Starting Configurator.load()...")
+        _t1 = time.time()
+        config.load()
+        print(f"[TIMING] Configurator.load(): {time.time()-_t1:.2f}s")
+    if save_config and outputdir is not None:
+        _t2 = time.time()
+        config.save_config(outputdir)
+        print(f"[TIMING] save_config: {time.time()-_t2:.2f}s")
+    return config
+
+
+def load_job_config(descriptor_path):
+    """Load a per-job YAML descriptor backed by a shared Configurator pickle."""
+    descriptor_path = pathlib.Path(descriptor_path)
+    with descriptor_path.open() as handle:
+        descriptor = yaml.safe_load(handle)
+
+    if not isinstance(descriptor, Mapping):
+        raise ValueError(f"Job descriptor {descriptor_path} must contain a YAML mapping")
+    if descriptor.get("schema_version") != 1:
+        raise ValueError(
+            f"Unsupported schema_version in job descriptor {descriptor_path}: "
+            f"{descriptor.get('schema_version')!r}"
+        )
+
+    base_dir = descriptor_path.resolve().parent
+
+    def resolve_path(key):
+        value = descriptor.get(key)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Job descriptor {descriptor_path} requires a non-empty {key!r} path")
+        path = pathlib.Path(value)
+        return path if path.is_absolute() else base_dir / path
+
+    configurator_path = resolve_path("configurator")
+    fileset_path = resolve_path("fileset")
+    with configurator_path.open("rb") as handle:
+        config = cloudpickle.load(handle)
+    with fileset_path.open() as handle:
+        filesets = yaml.safe_load(handle)
+    if not isinstance(filesets, Mapping):
+        raise ValueError(f"Job fileset {fileset_path} must contain a YAML mapping")
+    if not hasattr(config, "set_filesets_manually"):
+        raise TypeError(f"Object in {configurator_path} is not a PocketCoffea Configurator")
+    config.set_filesets_manually(dict(filesets))
+
+    workflow_options = descriptor.get("workflow_options", {})
+    if not isinstance(workflow_options, Mapping):
+        raise ValueError("Job descriptor 'workflow_options' must contain a YAML mapping")
+    merged_workflow_options = dict(getattr(config, "workflow_options", {}) or {})
+    merged_workflow_options.update(workflow_options)
+    config.workflow_options = merged_workflow_options
     return config
 
 def adapt_chunksize(nevents, run_options):
@@ -248,9 +301,12 @@ def dump_ak_arrays_to_root(
 def get_nano_version(events, params, year):
     '''Helper function to get the nano version from the events metadata or from the default parameters.'''
     if "nano_version" in events.metadata:
-        nano_version = events.metadata["nano_version"]
+        try:
+            nano_version = int(events.metadata["nano_version"])
+        except:
+            raise("The metadata nano_version needs to be convertible to an integer!")
     else:
-        if events.metadata.get("isMC", False):
+        if to_bool(events.metadata.get("isMC", False)):
             # Try to extract from the sample name
             if "NanoAODv12" in events.metadata["filename"]:
                 nano_version = 12

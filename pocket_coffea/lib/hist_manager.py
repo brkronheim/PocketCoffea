@@ -100,12 +100,13 @@ def get_hist_axis_from_config(ax: Axis):
             growth=ax.growth,
         )
     elif ax.type == "intcat":
+        # hist.axis.IntCategory has no `underflow` (categories have only an overflow
+        # "other" bin); passing underflow= raises TypeError, so it is dropped here.
         return hist.axis.IntCategory(
             ax.bins,
             name=ax.name,
             label=ax.label,
             overflow=ax.overflow,
-            underflow=ax.underflow,
             growth=ax.growth,
         )
     elif ax.type == "strcat":
@@ -116,25 +117,26 @@ def get_hist_axis_from_config(ax: Axis):
 
 def weights_cache(fun):
     '''
-    Function decorator to cache the weights calculation when they are ndim=1 on data_structure of ndim=1.
-    The weight is cached by (category, subsample, variation)
+    Function decorator to cache the broadcast+masked weight, keyed by
+    (category, subsample, variation).
+
+    The cache is used whenever the mask is per-event (ndim==1): both the plain per-event
+    weight (data_structure ndim<=1) and the collection broadcast (data_structure ndim==2)
+    are deterministic functions of (category, subsample, variation) once the caller makes
+    `category` collection-specific for the ndim==2 case (so histograms sharing a
+    collection reuse the broadcast while different collections do not collide).
+
+    A 2D mask (a cut on the collection) is NOT cached: the broadcast then depends on the
+    full collection mask rather than on the cached data_structure.
     '''
     def inner(self, category, subsample, variation, weight, mask, data_structure):
-        if mask.ndim == 2:
-            # Do not cache
-            return fun(self, weight, mask, data_structure)
-        #Cache only in the "by event" weight, which does not need to be
-        #broadcasted on the data dimension.
-        elif mask.ndim == 1 and (
-            (data_structure is None) or (data_structure.ndim == 1)
-        ):
+        if mask.ndim == 1:
             name = (category, subsample, variation)
             if name not in self._weights_cache:
                 self._weights_cache[name] = fun(self, weight, mask, data_structure)
-
             return self._weights_cache[name]
         else:
-            # if the mask is 2d, do not cache
+            # 2D mask (cut on the collection): do not cache
             return fun(self, weight, mask, data_structure)
     return inner
 
@@ -170,6 +172,10 @@ class HistManager:
         self.available_shape_variations = []
         # This dictionary is used to store the weights in some cases for performance reaso
         self._weights_cache = {}
+        # Caches the ones-like data structure (collection layout after masking) per
+        # (collection, category, subsample) so histograms sharing a collection don't
+        # rebuild it. Both caches are cleared per shape-variation in fill_histograms.
+        self._data_structure_cache = {}
 
         # We take the variations config and we build the available variations
         # for each category and for the whole sample (if MC)
@@ -388,13 +394,15 @@ class HistManager:
                 self.weights_manager, category, shape_variation,
             )
 
-        # Preload subsample-specific weights (MC only — data has no subsample SFs).
+        # Preload subsample-specific weights.
         # weights_sub[subsample][category][variation] holds the subsample weight for
         # the variations explicitly defined for that subsample; all other variations
         # fall back to the nominal subsample weight via dict.get() at fill time.
-        _t0 = time.time()
+        # Also preloaded for data: the configurator allows (non-isMC_only) by-subsample
+        # weights on data, and an unweighted subsample simply returns ones, so this is a
+        # no-op for the common data case but applies the weight when one is configured.
         weights_sub = {}
-        if self.has_subsamples and self.isMC:
+        if self.has_subsamples:
             for subsample in self.subsamples:
                 weights_sub[subsample] = {}
                 for category in self.available_categories:
@@ -403,9 +411,21 @@ class HistManager:
                         avail, self.weights_manager,
                         self.sample + "__" + subsample, category, shape_variation,
                     )
-        
-        # Cleaning the weights cache decorator between calls.
+        # Cleaning the per-shape-variation caches between calls.
         self._weights_cache.clear()
+        self._data_structure_cache.clear()
+
+        # Precompute the (category, subsample) event masks and their emptiness ONCE: they
+        # do not depend on the histogram, so recomputing `cat_mask & subs_mask` and
+        # `ak.sum(mask)==0` for every histogram (as the inner loop used to) is wasteful.
+        cat_masks_list = list(categories.get_masks())
+        subs_masks_list = list(subsamples.get_masks())
+        combined_masks = {}
+        for _category, _cat_mask in cat_masks_list:
+            for _subsample, _subs_mask in subs_masks_list:
+                _m = _cat_mask & _subs_mask
+                combined_masks[(_category, _subsample)] = (_m, ak.sum(_m) == 0)
+
         # Looping on the histograms to read the values only once
         # Then categories, subsamples and weights are applied and masked correctly
         # ASSUNTION, the histograms are the same for each subsample
@@ -454,6 +474,10 @@ class HistManager:
             fill_categorical = {}
             fill_numeric = {}
             data_ndim = None
+            # Collection whose (masked) layout the ndim==2 broadcast follows. Used to key
+            # the data-structure and weight-broadcast caches so histograms on the same
+            # collection reuse them while different collections do not collide.
+            data_coll = None
             # Per-histogram accumulators (local, summed into _per_hist at the end)
             _ph = {"axes": 0.0, "mask": 0.0, "weight": 0.0, "fill": 0.0, "n_fills": 0}
 
@@ -486,6 +510,21 @@ class HistManager:
                         # General collections
                         if ax.pos == None:
                             data = events[ax.coll][ax.field]
+                            # pos==None on a collection is the only source of ndim>1 data.
+                            # All ndim>1 axes of a histogram must come from the SAME
+                            # collection: the broadcast/data-structure caches assume a
+                            # single per-event layout keyed by `data_coll`, and two
+                            # collections may have different jagged counts per event (which
+                            # would also break the shared flatten/fill). The data_ndim check
+                            # below does NOT catch this since both collections are ndim==2.
+                            if data_coll is not None and data_coll != ax.coll:
+                                raise Exception(
+                                    f"Histogram {name} mixes full-collection (pos=None) axes "
+                                    f"from different collections ('{data_coll}' and '{ax.coll}'). "
+                                    "All pos=None axes of a histogram must reference the same "
+                                    "collection so their per-event layout matches."
+                                )
+                            data_coll = ax.coll
                         elif ax.pos >= 0:
                             # Use the per-chunk pad cache to avoid re-running
                             # ak.pad_none + index for the same (coll, field, pos)
@@ -535,16 +574,22 @@ class HistManager:
             # Now the variables have been read for all the events
             # We need now to iterate on categories and subsamples
             # Mask the events, the weights and then flatten and remove the None correctly
-            for category, cat_mask in categories.get_masks():
+            for category, _cat_mask in cat_masks_list:
+                # Skip categories this histogram does not cover. The category axis is
+                # growth=False and holds only histo.only_categories, so filling any other
+                # category would silently land in the overflow bin (contaminating
+                # flow-inclusive projections) on top of wasting the masking/flatten work.
+                if category not in histo.only_categories:
+                    continue
                 # loop directly on subsamples
-                for subsample, subs_mask in subsamples.get_masks():
+                for subsample, _subs_mask in subs_masks_list:
                     # logging.info(f"\t\tcategory {category}, subsample {subsample}")
                     _n_cats_sub_combos += 1
-                    _t_iter = time.time()
-                    _t_combo = time.time()
-                    mask = cat_mask & subs_mask
+                    # Use the mask and emptiness precomputed once for this (category,
+                    # subsample) instead of recomputing them for every histogram.
+                    mask, mask_is_empty = combined_masks[(category, subsample)]
                     # Skip empty categories and subsamples
-                    if ak.sum(mask) == 0:
+                    if mask_is_empty:
                         continue
 
                     # Check if the required data is dim=1, per event,
@@ -554,8 +599,21 @@ class HistManager:
                     # WARNING!! POTENTIAL PROBLEMATIC BEHAVIOUR
                     # The user must be aware of the behavior.
 
+                    # Cache key for the by-event weight broadcast. Normally the masked
+                    # weight is identical for every histogram in this (category, subsample,
+                    # variation), so the plain category keeps the cache shared. But when a
+                    # 2D category mask is collapsed below, the resulting 1D mask depends on
+                    # this histogram's collapse mode, so the key must be per-histogram.
+                    if data_ndim is not None and data_ndim > 1:
+                        # 2D collection histogram: key the broadcast cache by the
+                        # collection so histograms sharing it reuse the broadcast (used
+                        # only when mask.ndim==1; a 2D mask below is not cached).
+                        weight_cache_cat = f"{category}::coll::{data_coll}"
+                    else:
+                        weight_cache_cat = category
                     if data_ndim == 1 and mask.ndim > 1:
                         if histo.collapse_2D_masks:
+                            weight_cache_cat = f"{category}::collapse::{name}"
                             if histo.collapse_2D_masks_mode == "OR":
                                 mask = ak.any(mask, axis=1)
                             elif histo.collapse_2D_masks_mode == "AND":
@@ -599,7 +657,14 @@ class HistManager:
                             # We need to flatten and
                             # save the data structure for weights propagation
                             if not has_data_structure:
-                                data_structure = ak.ones_like(masked_data)
+                                # ones_like of the masked collection depends only on
+                                # (collection, category, subsample); reuse it across
+                                # histograms sharing the collection.
+                                _ds_key = (data_coll, category, subsample)
+                                data_structure = self._data_structure_cache.get(_ds_key)
+                                if data_structure is None:
+                                    data_structure = ak.ones_like(masked_data)
+                                    self._data_structure_cache[_ds_key] = data_structure
                                 has_data_structure = True
                             # flatten the data in one dimension
                             masked_data = ak.flatten(masked_data)
@@ -766,7 +831,7 @@ class HistManager:
                                     weight_varied = _bcast_factor * np.repeat(_w_np, _bcast_per_event)
                                 else:
                                     weight_varied = self.mask_and_broadcast_weight(
-                                        category,
+                                        weight_cache_cat,
                                         subsample,
                                         variation,
                                         weight_combined,
@@ -776,7 +841,7 @@ class HistManager:
                                 _ph["weight_hoist"] = _ph.get("weight_hoist", 0.0) + (time.time() - _t_w_hoist)
                                 if custom_weight != None and name in custom_weight:
                                     weight_varied = weight_varied * self.mask_and_broadcast_weight(
-                                        category + "customW",
+                                        f"{category}::customW::{name}",
                                         subsample,
                                         variation,
                                         custom_weight[
@@ -825,17 +890,17 @@ class HistManager:
                             weight_sub = weights_sub[subsample][category]["nominal"] if self.has_subsamples else 1.
                                 
                             weight_nom = self.mask_and_broadcast_weight(
-                                category,
+                                weight_cache_cat,
                                 subsample,
                                 "nominal",
-                                weight_nom * weight_sub,
+                                (weight_nom * weight_sub) if self.has_subsamples else weight_nom,
                                 mask,
                                 data_structure,
                             )
-                            
+
                             if custom_weight != None and name in custom_weight:
                                 weight_nom = weight_nom * self.mask_and_broadcast_weight(
-                                    category + "customW",
+                                    f"{category}::customW::{name}",
                                     subsample,
                                     "nominal",
                                     custom_weight[
@@ -868,17 +933,22 @@ class HistManager:
                     elif not histo.no_weights and not self.isMC:   #DATA
                         # Broadcast and mask the weight (using the cached value if possible)
                         weight_data = weights[category]["nominal"]
+                        # Fold in the by-subsample data weight (ones if none configured).
+                        weight_sub = (
+                            weights_sub[subsample][category]["nominal"]
+                            if self.has_subsamples else 1.
+                        )
                         weight_data = self.mask_and_broadcast_weight(
-                            category,
+                            weight_cache_cat,
                             subsample,
                             "nominal",
-                            weight_data,
+                            (weight_data * weight_sub) if self.has_subsamples else weight_data,
                             mask,
                             data_structure,
                         )
                         if custom_weight != None and name in custom_weight:
                             weight_data = weight_data * self.mask_and_broadcast_weight(
-                                category + "customW",
+                                f"{category}::customW::{name}",
                                 subsample,
                                 "nominal",
                                 custom_weight[

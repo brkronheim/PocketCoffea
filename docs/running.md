@@ -387,18 +387,26 @@ longest are `espresso`, `microcentury`, `longlunch`, `workday`, `tomorrow`, `tes
 #### cmsConnect remote Condor jobs
 
 `condor@cmsconnect` is designed for remote worker nodes with no AFS access. It uses
-an EL9 apptainer image, an XRootD-staged payload tarball containing the shared
-`Configurator`, compact `fileset_job_{i}.yaml` files, run-option YAML, and analysis
-payload, plus an optional separately staged Python environment tarball. Each worker
-fetches the payload and Python environment with `xrdcp`, activates the environment
-locally, runs PocketCoffea, then copies outputs and status markers to XRootD
-destinations with `xrdcp`.
+an EL9 apptainer image, an XRootD-staged static payload containing one shared
+`Configurator`, run-option YAML, and the analysis payload, plus a separate archive of
+compact `config_job_{i}.yaml` descriptors and `fileset_job_{i}.yaml` files. Keeping the
+per-job text configs separate lets `check-jobs --resubmit` restage only the failed
+job's descriptor and fileset without overwriting an archive that active workers may be
+reading. An optional Python environment tarball is staged separately. Each worker
+fetches these inputs with `xrdcp`, activates the environment locally, runs
+PocketCoffea, then copies outputs and state markers to XRootD destinations.
 
 ```bash
-pocket-coffea run --cfg config.py -o /eos/user/u/user/output \
+pocket-coffea run --cfg config.py \
+  -o root://eosuser.cern.ch//eos/user/u/user/output \
     --executor condor@cmsconnect --scaleout 50 \
     --custom-run-options cmsconnect_options.yaml
 ```
+
+When `-o` is a `root://` URL, runner logs, config snapshots, and Condor submit files
+are kept locally under `cmsconnect_jobs/<output-name>_<destination-hash>/`; only the
+declared outputs are written remotely. Set `jobs-dir` in the run-options YAML to choose
+a different local submit root. A locally mounted `/eos/...` path is also supported.
 
 Common cmsConnect options:
 
@@ -425,8 +433,8 @@ analysis-transfer-paths:             # copied into PYTHONPATH on the worker
   - params
   - MVA
 staging-area: null                   # defaults to <output-destination>/cmsconnect_staging/<job-name>
-output-destination: null             # arbitrary XRootD output directory; defaults to -o when -o is under /eos/
-status-destination: null             # defaults to <output-destination>/status for check-jobs polling
+output-destination: null             # arbitrary XRootD output directory; defaults to root:// or /eos/ -o
+status-destination: null             # defaults to <output-destination>/status/<job-name>
 convert-parquet-to-root: false       # merge dumped per-chunk column ROOT files into one per-job ROOT file
 parquet-output-dir: columns          # local worker directory used for dumped column ROOT chunks
 keep-coffea-output: true             # set false to return only converted ROOT output
@@ -437,6 +445,13 @@ through `dump_columns_as_arrays_per_chunk`, the worker rewrites that destination
 local `parquet-output-dir`, merges the per-chunk ROOT files with `parquet-to-root`, and
 copies `output_job_{i}_skim.root` to `output-destination` with `xrdcp`. The same XRootD
 copy path is used for `output_job_{i}.coffea` when `keep-coffea-output: true`.
+
+Each worker publishes `job_{i}.running`, `job_{i}.done`, or `job_{i}.failed` under the
+status destination. `check-jobs` synchronizes all states with one `xrdfs ls` per
+refresh, so monitoring does not start one transfer process per job. Retry count is
+controlled by `check-jobs --max-resubmit`; it is not an HTCondor submit-file setting.
+Use `pocket-coffea inspect-job path/to/config_job_0.yaml` to inspect the resolved
+configurator, workflow options, and fileset for a CMS Connect job.
 
 For the smallest worker environment, create a dedicated CPU-only venv for cmsConnect
 and pass it with `python-env-path`. It should contain PocketCoffea and the runtime
@@ -525,9 +540,10 @@ This is currently implemented for the manual-job executors (`condor@lxplus`,
 The HTCondor-based manual-job executors (`condor@lxplus`, `condor@rubin`, ...) submit one
 HTCondor job per chunk-group and pickle the per-job `Configurator` to
 `jobs_dir/config_job_{i}.pkl`. `condor@cmsconnect` instead keeps one shared configurator
-and stores each job fileset in `jobs_dir/fileset_job_{i}.yaml`; `check-jobs --resubmit`
-updates either format when it rewrites failed XRootD paths. To resubmit a subset of the
-legacy pickle-based jobs without re-running the splitting, use `--recreate-jobs`:
+pickle, stores each job fileset in `jobs_dir/fileset_job_{i}.yaml`, and points to both
+from `jobs_dir/config_job_{i}.yaml`; `check-jobs --resubmit` updates either format when
+it rewrites failed XRootD paths. To resubmit a subset of the legacy pickle-based jobs
+without re-running the splitting, use `--recreate-jobs`:
 
 ```bash
 # Resubmit specific jobs
@@ -552,7 +568,7 @@ pocket-coffea run --cfg config.py -o output/ --executor condor \
 
 For each input file whose redirector matches a blocklisted site, Rucio is queried for an
 alternative replica at a non-blocklisted site. If none is found, the file is rewritten to
-use the global xrootd redirector (`root://xrootd-cms.infn.it//`) instead of keeping the
+use the global xrootd redirector (`root://cms-xrd-global.cern.ch//`) instead of keeping the
 blocklisted URL. Files at non-blocklisted sites are left untouched, and file order is
 preserved. The original `jobs_config.yaml` is not modified — only the per-job pickle.
 
@@ -587,7 +603,7 @@ to jobs found in the `.running` state.
 
 When many sites are flaky and you don't want to spend time on per-file Rucio lookups,
 use `--use-redirector` to rewrite **every** file in the resubmitted jobs to use the
-global xrootd redirector (`root://xrootd-cms.infn.it//`), letting xrootd figure out
+global xrootd redirector (`root://cms-xrd-global.cern.ch//`), letting xrootd figure out
 routing on the fly:
 
 ```bash
@@ -646,6 +662,9 @@ It polls a `jobs_dir/` every few seconds, prints a rich summary of how many jobs
 idle / running / done / failed (using the `.idle / .running / .done / .failed` flag
 files written by the wrapper script), and can optionally drive resubmission of failed
 jobs in place — without having to call `pocket-coffea run --recreate-jobs` yourself.
+For `condor@cmsconnect`, it also synchronizes remote status markers and falls back to
+HTCondor history plus the configured XRootD outputs if a worker cannot upload its
+final marker.
 
 ```bash
 # Just watch the jobs (read-only)
@@ -655,8 +674,9 @@ pocket-coffea check-jobs -j /path/to/output/job
 pocket-coffea check-jobs -j /path/to/output/job --resubmit
 ```
 
-If you point `-j` at the parent output directory and it contains a single subfolder
-called `job`, the tool descends into it automatically.
+If you point `-j` at a parent directory containing exactly one child with
+`job_*.sub` files, the tool descends into that child automatically. It reports an
+error for an empty directory or an ambiguous parent with multiple job directories.
 
 #### Options
 
@@ -694,8 +714,14 @@ For every job whose flag file is `.failed`, `check-jobs` inspects
 After patching, the script issues `condor_submit job_{i}.sub`, removes the `.failed`
 flag, and touches `.idle`.
 
-The tool exits automatically when `done + failed == total`, and prints the suggested
-next command:
+For `condor@cmsconnect`, the per-job fileset YAML is repacked and uploaded before
+resubmission. All stale local and remote status markers must be removed successfully
+before the new attempt is submitted.
+
+The tool exits automatically when every job is done or permanently failed. With
+`--resubmit`, a failed job remains active until its retry budget is exhausted; a
+successful resubmission or a transient restaging error cannot make the monitor exit
+early. The tool then prints the suggested next command:
 
 ```
 All jobs are completed
