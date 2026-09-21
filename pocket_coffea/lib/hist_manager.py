@@ -1027,17 +1027,24 @@ class HistManager:
             _ph["total"] = time.time() - _t_hist_total
             _per_hist[name] = _ph
 
-        # Per-histogram fill loop summary
-        print(
-            f"[TIMING]     [fill_histograms] DONE (shape_variation={shape_variation!r}, "
-            f"n_hists={_n_hists}, n_cat_sub_combos={_n_cats_sub_combos}, "
-            f"axes_extraction={_t_axes_total:.3f}s, "
-            f"mask+flatten={_t_mask_total:.3f}s, "
-            f"weight+broadcast={_t_weight_total:.3f}s, "
-            f"hist.fill={_t_fill_total:.3f}s, "
-            f"total_in_func={time.time()-_t_func:.3f}s, "
-            f"pad_cache_size={len(_pad_cache)})"
-        )
+        # Per-histogram fill loop summary.  This is intentionally level 2:
+        # it is useful while profiling a workflow but far too noisy for a
+        # normal run, where fill_histograms is called once per variation.
+        try:
+            verbose = int(getattr(self.processor_params, "verbose", 0) or 0)
+        except (TypeError, ValueError):
+            verbose = 0
+        if verbose >= 2:
+            print(
+                f"[TIMING]     [fill_histograms] DONE (shape_variation={shape_variation!r}, "
+                f"n_hists={_n_hists}, n_cat_sub_combos={_n_cats_sub_combos}, "
+                f"axes_extraction={_t_axes_total:.3f}s, "
+                f"mask+flatten={_t_mask_total:.3f}s, "
+                f"weight+broadcast={_t_weight_total:.3f}s, "
+                f"hist.fill={_t_fill_total:.3f}s, "
+                f"total_in_func={time.time()-_t_func:.3f}s, "
+                f"pad_cache_size={len(_pad_cache)})"
+            )
 
 
 
@@ -1088,6 +1095,5 @@ class HistManager:
             )
         else:
             return ak.to_numpy(weight[mask], allow_missing=False)
-
 
 

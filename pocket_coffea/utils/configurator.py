@@ -151,16 +151,16 @@ class Configurator:
     def load(self):
         '''This function loads the configuration for samples/weights/variations and creates
         the necessary objects for the processor to use. It also loads the workflow'''
-        print("[TIMING] Configurator.load() - start")
+        self._print_timing("[TIMING] Configurator.load() - start")
         _t_load = time.time()
         _t0 = time.time()
         if not self.filesets_loaded:
             # Avoid reloading the datasets if the configurator already loaded them manually.
             # This happens when the configurator is manipulated to restrict the fileset before pickling (condor submission)
             self.load_datasets()
-            print(f"[TIMING]   load_datasets: {time.time()-_t0:.2f}s")
+            self._print_timing(f"[TIMING]   load_datasets: {time.time()-_t0:.2f}s")
         else:
-            print("[TIMING]   load_datasets: skipped (filesets already loaded)")
+            self._print_timing("[TIMING]   load_datasets: skipped (filesets already loaded)")
 
         # Now loading and storing the metadata of the filtered filesets
         if len(self.filesets) == 0:
@@ -190,7 +190,7 @@ class Configurator:
             
         _t0 = time.time()
         self.load_subsamples()
-        print(f"[TIMING]   load_subsamples: {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_subsamples: {time.time()-_t0:.2f}s")
 
         # Categories: object handling categorization
         # - StandardSelection
@@ -199,7 +199,7 @@ class Configurator:
         # in the objects needed in the processors
         _t0 = time.time()
         self.load_cuts_and_categories(self.skim_cfg, self.preselections_cfg, self.categories_cfg)
-        print(f"[TIMING]   load_cuts_and_categories: {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_cuts_and_categories: {time.time()-_t0:.2f}s")
 
         self.weights_config = {
             s: {
@@ -236,7 +236,7 @@ class Configurator:
          
         _t0 = time.time()
         self.load_weights_config(self.weights_cfg)
-        print(f"[TIMING]   load_weights_config: {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_weights_config: {time.time()-_t0:.2f}s")
         # keeping a unique list of requested weight to load
         self.requested_weights = list(set(self.requested_weights))
         self.weights_classes = list(filter(lambda x: x.name in self.requested_weights, self.weights_classes))
@@ -283,10 +283,10 @@ class Configurator:
 
         _t0 = time.time()
         self.load_variations_config(self.variations_cfg["weights"], variation_type="weights")
-        print(f"[TIMING]   load_variations_config (weights): {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_variations_config (weights): {time.time()-_t0:.2f}s")
         _t0 = time.time()
         self.load_variations_config(self.variations_cfg["shape"], variation_type="shape")
-        print(f"[TIMING]   load_variations_config (shape): {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_variations_config (shape): {time.time()-_t0:.2f}s")
             
         # Collecting overall list of available weights and shape variations per sample
         self.available_weights_variations = {s: ["nominal"] for s in self.samples}
@@ -318,11 +318,11 @@ class Configurator:
         # Columns configuration
         _t0 = time.time()
         self.load_columns_config(self.columns_cfg)
-        print(f"[TIMING]   load_columns_config: {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_columns_config: {time.time()-_t0:.2f}s")
 
         _t0 = time.time()
         self.perform_checks()
-        print(f"[TIMING]   perform_checks: {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   perform_checks: {time.time()-_t0:.2f}s")
         
         # Check if the jet calibration is legacy or not, and build the
         # calibrator factory file if not present
@@ -331,16 +331,25 @@ class Configurator:
             _t0 = time.time()
             if not os.path.exists(self.parameters.jets_calibration.factory_file):
                 build_jets_calibrator.build(self.parameters.jets_calibration)
-            print(f"[TIMING]   jet calibration factory: {time.time()-_t0:.2f}s")
+            self._print_timing(f"[TIMING]   jet calibration factory: {time.time()-_t0:.2f}s")
             
         # Load the workflow as the last thing
         _t0 = time.time()
         self.load_workflow()
-        print(f"[TIMING]   load_workflow: {time.time()-_t0:.2f}s")
+        self._print_timing(f"[TIMING]   load_workflow: {time.time()-_t0:.2f}s")
 
         # Mark the configurator as loaded
         self.loaded = True
-        print(f"[TIMING] Configurator.load() - total: {time.time()-_t_load:.2f}s")
+        self._print_timing(f"[TIMING] Configurator.load() - total: {time.time()-_t_load:.2f}s")
+
+    def _print_timing(self, message, level=1):
+        """Print configuration timing only when the configured verbosity allows it."""
+        try:
+            verbose = int(getattr(self.parameters, "verbose", 0) or 0)
+        except (TypeError, ValueError):
+            verbose = 0
+        if verbose >= level:
+            print(message)
 
     def load_datasets(self):
         for json_dataset in self.datasets_cfg["jsons"]:

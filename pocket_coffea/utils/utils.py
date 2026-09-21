@@ -80,10 +80,8 @@ def path_import(absolute_path):
     
 def load_config(cfg, do_load=True, save_config=True, outputdir=None):
     ''' Helper function to load a Configurator instance from a user defined python module'''
-    print(f"[TIMING] Starting path_import for config: {cfg}")
     _t0 = time.time()
     config_module =  path_import(cfg)
-    print(f"[TIMING] path_import: {time.time()-_t0:.2f}s")
     try:
         config = config_module.cfg
     except AttributeError as e:
@@ -93,19 +91,23 @@ def load_config(cfg, do_load=True, save_config=True, outputdir=None):
     if not isinstance(config, Configurator):
         raise Exception("The configuration module attribute `cfg` is not of type Configurator. Please check your configuration!")
 
+    config._print_timing(
+        f"[TIMING] path_import for {cfg}: {time.time()-_t0:.2f}s"
+    )
+
     # Load/save the configuration OUTSIDE the AttributeError guard above: a
     # genuine AttributeError raised inside config.load() is a real bug in the
     # user's config and must surface with its own traceback, not be masked as a
     # missing `cfg` attribute.
     if do_load:
-        print(f"[TIMING] Starting Configurator.load()...")
+        config._print_timing("[TIMING] Starting Configurator.load()...")
         _t1 = time.time()
         config.load()
-        print(f"[TIMING] Configurator.load(): {time.time()-_t1:.2f}s")
+        config._print_timing(f"[TIMING] Configurator.load(): {time.time()-_t1:.2f}s")
     if save_config and outputdir is not None:
         _t2 = time.time()
         config.save_config(outputdir)
-        print(f"[TIMING] save_config: {time.time()-_t2:.2f}s")
+        config._print_timing(f"[TIMING] save_config: {time.time()-_t2:.2f}s")
     return config
 
 

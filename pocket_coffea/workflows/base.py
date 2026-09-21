@@ -54,6 +54,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self.workflow_options = self.cfg.workflow_options
         # Saving the parameters from the configurator objects
         self.params = self.cfg.parameters
+        # Keep framework diagnostics consistent with user-workflow diagnostics.
+        # ``verbose=0`` is the quiet/default mode; higher levels opt into
+        # progressively more detailed timing and tracing output.
+        try:
+            self.verbose = int(getattr(self.params, "verbose", 0) or 0)
+        except (TypeError, ValueError):
+            self.verbose = 0
         # Cuts
         # 1) a list of *skim* functions is applied on bare NanoAOD, with no object preselection or correction.
         #   Triggers are also applied there.
@@ -580,10 +587,11 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             tree_path = f"{variation}/{subs}/{category}" if subs is not None else f"{variation}/{category}"
             self._column_root_arrays[tree_path] = akarr
             written += 1
-            if subs is not None:
-                print(f"[TIMING]         columns category={category}, subs={subs}, rows={len(akarr)}")
-            else:
-                print(f"[TIMING]         columns category={category}, rows={len(akarr)}")
+            if self.verbose >= 2:
+                if subs is not None:
+                    print(f"[TIMING]         columns category={category}, subs={subs}, rows={len(akarr)}")
+                else:
+                    print(f"[TIMING]         columns category={category}, rows={len(akarr)}")
 
         self._column_root_skipped_empty += skipped_empty
         return written, skipped_empty
@@ -592,9 +600,10 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         if not self._is_dumping_columns_to_root() or len(self.column_managers) == 0:
             return
         if not getattr(self, "_column_root_arrays", None):
-            print(
+            self._print_timing_message(
                 f"[TIMING]     columns ROOT chunk dump: no non-empty categories, "
-                f"skipped_empty={getattr(self, '_column_root_skipped_empty', 0)}"
+                f"skipped_empty={getattr(self, '_column_root_skipped_empty', 0)}",
+                level=2,
             )
             return
 
@@ -605,12 +614,13 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             self._column_root_dump_location,
             [self._dataset],
         )
-        print(
+        self._print_timing_message(
             f"[TIMING]     columns ROOT chunk dump: build={self._column_root_build_time:.3f}s, "
             f"write={_dump_timing.get('total', 0.0):.3f}s "
             f"(root_write={_dump_timing.get('root_write', 0.0):.3f}s, copy={_dump_timing.get('copy', 0.0):.3f}s), "
             f"written_trees={_dump_timing.get('trees_written', 0)}, skipped_empty={self._column_root_skipped_empty}, "
-            f"total={time.time()-_t0+self._column_root_build_time:.3f}s"
+            f"total={time.time()-_t0+self._column_root_build_time:.3f}s",
+            level=2,
         )
 
     def fill_column_accumulators(self, variation):
@@ -642,10 +652,11 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                     _build_time = time.time() - _columns_total_start
                     self._column_root_build_time += _build_time
                     _written, _skipped_empty = self._queue_column_root_arrays(out_arrays, variation, subs=subs)
-                    print(
+                    self._print_timing_message(
                         f"[TIMING]       columns ROOT queue subs={subs}: build={_build_time:.3f}s, "
                         f"queued_categories={_written}, skipped_empty={_skipped_empty}, "
-                        f"total={time.time()-_columns_total_start:.3f}s"
+                        f"total={time.time()-_columns_total_start:.3f}s",
+                        level=2,
                     )
 
                 else:
@@ -682,10 +693,11 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 _build_time = time.time() - _t0
                 self._column_root_build_time += _build_time
                 _written, _skipped_empty = self._queue_column_root_arrays(out_arrays, variation)
-                print(
+                self._print_timing_message(
                     f"[TIMING]       columns ROOT queue: build={_build_time:.3f}s, "
                     f"queued_categories={_written}, skipped_empty={_skipped_empty}, "
-                    f"total={time.time()-_columns_total_start:.3f}s"
+                    f"total={time.time()-_columns_total_start:.3f}s",
+                    level=2,
                 )
             else:
                 outcols[self._sample] = {self._dataset: self.column_managers[
@@ -858,7 +870,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         """Run one calibrated variation as a distinct profiling frame."""
         _var_start = time.time()
         _t_step = _var_start
-        print(f"[TIMING]     [Variation {variation}] start")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] start")
         # Custom code just after calibrations
         self._run_phase(
             "process_extra_after_calibrators",
@@ -866,7 +878,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             variation,
         )
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] process_extra_after_calibrators: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] process_extra_after_calibrators: {_t_now-_t_step:.3f}s")
         self._record_phase("process_extra_after_calibrators", _t_now - _t_step)
         _t_step = _t_now
 
@@ -876,7 +888,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         )
         self._run_phase("object_counting", self.count_objects, variation)
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] apply_object_preselection+count_objects: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] apply_object_preselection+count_objects: {_t_now-_t_step:.3f}s")
         self._record_phase("object_preselection_and_counting", _t_now - _t_step)
         _t_step = _t_now
 
@@ -893,7 +905,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             variation,
         )
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] define_common_variables_before_presel+extra: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] define_common_variables_before_presel+extra: {_t_now-_t_step:.3f}s")
         self._record_phase("common_variables_before_presel", _t_now - _t_step)
         _t_step = _t_now
 
@@ -901,7 +913,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         if variation == "nominal":
             self.delayed_branches.prepare_nominal_snapshot(self.events)
             _t_now = time.time()
-            print(f"[TIMING]     [Variation {variation}] delayed_branches.prepare_nominal_snapshot: {_t_now-_t_step:.3f}s")
+            self._print_timing_message(f"[TIMING]     [Variation {variation}] delayed_branches.prepare_nominal_snapshot: {_t_now-_t_step:.3f}s")
             self._record_phase("delayed_branch_snapshot", _t_now - _t_step)
             _t_step = _t_now
 
@@ -918,11 +930,11 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
         # If no events remain after the preselection we skip the variation
         if not self.has_events:
-            print(f"[TIMING]     [Variation {variation}] No events after preselection, skipping. Time: {time.time()-_var_start:.3f}s")
+            self._print_timing_message(f"[TIMING]     [Variation {variation}] No events after preselection, skipping. Time: {time.time()-_var_start:.3f}s")
             return
 
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] apply_preselections: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] apply_preselections: {_t_now-_t_step:.3f}s")
         self._record_phase("apply_preselections", _t_now - _t_step)
         _t_step = _t_now
 
@@ -941,7 +953,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             variation,
         )
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] define_common_variables_after_presel+extra: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] define_common_variables_after_presel+extra: {_t_now-_t_step:.3f}s")
         self._record_phase("common_variables_after_presel", _t_now - _t_step)
         _t_step = _t_now
 
@@ -949,7 +961,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         # Each category is an AND of some cuts.
         self._run_phase("define_categories", self.define_categories, variation)
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] define_categories: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] define_categories: {_t_now-_t_step:.3f}s")
         self._record_phase("define_categories", _t_now - _t_step)
         _t_step = _t_now
 
@@ -962,14 +974,14 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             self._categories,
         )
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] delayed_branches.update_for_current_variation: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] delayed_branches.update_for_current_variation: {_t_now-_t_step:.3f}s")
         self._record_phase("update_delayed_branches", _t_now - _t_step)
         _t_step = _t_now
 
         # Weights
         self._run_phase("compute_weights", self.compute_weights, variation)
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] compute_weights: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] compute_weights: {_t_now-_t_step:.3f}s")
         self._record_phase("compute_weights", _t_now - _t_step)
         _t_step = _t_now
 
@@ -977,7 +989,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             "compute_weights_extra", self.compute_weights_extra, variation
         )
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] compute_weights_extra: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] compute_weights_extra: {_t_now-_t_step:.3f}s")
         self._record_phase("compute_weights_extra", _t_now - _t_step)
         _t_step = _t_now
 
@@ -985,7 +997,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self._run_phase("fill_histograms", self.fill_histograms, variation)
 
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] fill_histograms: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] fill_histograms: {_t_now-_t_step:.3f}s")
         self._record_phase("fill_histograms", _t_now - _t_step)
         _t_step = _t_now
 
@@ -994,7 +1006,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         )
 
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] fill_histograms_extra: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] fill_histograms_extra: {_t_now-_t_step:.3f}s")
         self._record_phase("fill_histograms_extra", _t_now - _t_step)
         _t_step = _t_now
 
@@ -1003,7 +1015,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         )
 
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] fill_column_accumulators: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] fill_column_accumulators: {_t_now-_t_step:.3f}s")
         self._record_phase("fill_column_accumulators", _t_now - _t_step)
         _t_step = _t_now
 
@@ -1013,22 +1025,27 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             variation,
         )
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] fill_histograms+columns: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] fill_histograms+columns: {_t_now-_t_step:.3f}s")
         self._record_phase("fill_column_accumulators_extra", _t_now - _t_step)
         _t_step = _t_now
 
         # Count events
         self._run_phase("count_events", self.count_events, variation)
         _t_now = time.time()
-        print(f"[TIMING]     [Variation {variation}] count_events: {_t_now-_t_step:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] count_events: {_t_now-_t_step:.3f}s")
         self._record_phase("count_events", _t_now - _t_step)
-        print(f"[TIMING]     [Variation {variation}] done. Time: {time.time()-_var_start:.3f}s")
+        self._print_timing_message(f"[TIMING]     [Variation {variation}] done. Time: {time.time()-_var_start:.3f}s")
 
     def _record_phase(self, label, duration):
         if os.environ.get("POCKET_COFFEA_PROFILE_PHASES") == "1" and hasattr(
             self, "_phase_records"
         ):
             self._phase_records.append((label, duration))
+
+    def _print_timing_message(self, message, level=1):
+        """Print a framework timing message when the requested verbosity is active."""
+        if self.verbose >= level:
+            print(message)
 
     def _run_phase(self, label, function, *args, **kwargs):
         if (
@@ -1100,7 +1117,9 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self._prepare_column_root_dump()
 
         ds_name = events.metadata.get("dataset", "unknown") if hasattr(events, 'metadata') else "unknown"
-        print(f"[TIMING]   [Chunk begin] dataset={ds_name}, nevents_initial={len(events)}")
+        self._print_timing_message(
+            f"[TIMING]   [Chunk begin] dataset={ds_name}, nevents_initial={len(events)}"
+        )
 
         ###################
         # At the beginning of the processing the initial number of events
@@ -1109,7 +1128,7 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         _t0 = time.time()
         self._run_phase("load_metadata", self.load_metadata)
         self._run_phase("load_metadata_extra", self.load_metadata_extra)
-        print(f"[TIMING]     load_metadata: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     load_metadata: {time.time()-_t0:.3f}s")
 
         self.nEvents_initial = self.nevents
         self.output['cutflow']['initial'][self._dataset] = self.nEvents_initial
@@ -1135,13 +1154,19 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
         self._run_phase(
             "process_extra_before_skim", self.process_extra_before_skim
         )
-        print(f"[TIMING]     process_extra_before_skim: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     process_extra_before_skim: {time.time()-_t0:.3f}s")
         # MET filter, lumimask, + custom skimming function
         _t0 = time.time()
         self._run_phase("skim_events", self.skim_events)
-        print(f"[TIMING]     skim_events: {time.time()-_t0:.3f}s (events after skim: {self.nEvents_after_skim if hasattr(self, 'nEvents_after_skim') else 'N/A'})")
+        self._print_timing_message(
+            f"[TIMING]     skim_events: {time.time()-_t0:.3f}s "
+            f"(events after skim: {self.nEvents_after_skim if hasattr(self, 'nEvents_after_skim') else 'N/A'})"
+        )
         if not self.has_events:
-            print(f"[TIMING]   [Chunk end] No events after skim, returning early. Total chunk time: {time.time()-_chunk_start:.3f}s")
+            self._print_timing_message(
+                f"[TIMING]   [Chunk end] No events after skim, returning early. "
+                f"Total chunk time: {time.time()-_chunk_start:.3f}s"
+            )
             return self.output
 
         skim_mode = self.workflow_options.get("skim_mode", "skim") if self.workflow_options else "skim"
@@ -1153,7 +1178,10 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
                 f"(skim cuts on raw NanoAOD, no calibration / no preselection)."
             )
             self.export_skimmed_chunk()
-            print(f"[TIMING]   [Chunk end] Exported skimmed chunk. Total chunk time: {time.time()-_chunk_start:.3f}s")
+            self._print_timing_message(
+                f"[TIMING]   [Chunk end] Exported skimmed chunk. "
+                f"Total chunk time: {time.time()-_chunk_start:.3f}s"
+            )
             return self.output
 
         # --- Systematic-aware skimming logic
@@ -1207,28 +1235,28 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
 
         _t0 = time.time()
         self._run_phase("process_extra_after_skim", self.process_extra_after_skim)
-        print(f"[TIMING]     process_extra_after_skim: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     process_extra_after_skim: {time.time()-_t0:.3f}s")
         # Define and load the calibators
         _t0 = time.time()
         self._run_phase("initialize_calibrators", self.initialize_calibrators)
-        print(f"[TIMING]     initialize_calibrators: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     initialize_calibrators: {time.time()-_t0:.3f}s")
         # Define and load the weights manager
         _t0 = time.time()
         self._run_phase("define_weights", self.define_weights)
-        print(f"[TIMING]     define_weights: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     define_weights: {time.time()-_t0:.3f}s")
         # Create the HistManager and ColumnManager before systematic variations
         _t0 = time.time()
         self._run_phase("define_custom_axes_extra", self.define_custom_axes_extra)
         self._run_phase("define_histograms", self.define_histograms)
         self._run_phase("define_histograms_extra", self.define_histograms_extra)
-        print(f"[TIMING]     define_histograms: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     define_histograms: {time.time()-_t0:.3f}s")
         _t0 = time.time()
         self._run_phase("define_column_accumulators", self.define_column_accumulators)
         self._run_phase(
             "define_column_accumulators_extra",
             self.define_column_accumulators_extra,
         )
-        print(f"[TIMING]     define_column_accumulators: {time.time()-_t0:.3f}s")
+        self._print_timing_message(f"[TIMING]     define_column_accumulators: {time.time()-_t0:.3f}s")
 
         n_variations = 0
         for variation in self.loop_over_variations():
@@ -1236,17 +1264,23 @@ class BaseProcessorABC(processor.ProcessorABC, ABC):
             self._run_variation(variation)
 
         self.stop_time = time.time()
-        print(f"[TIMING]     Variations processed: {n_variations}")
+        self._print_timing_message(f"[TIMING]     Variations processed: {n_variations}")
         _t0 = time.time()
         self._run_phase(
             "flush_column_accumulators_to_root",
             self.flush_column_accumulators_to_root,
         )
-        print(f"[TIMING]     flush_column_accumulators_to_root: {time.time()-_t0:.3f}s")
+        self._print_timing_message(
+            f"[TIMING]     flush_column_accumulators_to_root: {time.time()-_t0:.3f}s"
+        )
         _t0 = time.time()
         self._run_phase("save_processing_metadata", self.save_processing_metadata)
-        print(f"[TIMING]     save_processing_metadata: {time.time()-_t0:.3f}s")
-        print(f"[TIMING]   [Chunk end] Total chunk time: {time.time()-_chunk_start:.3f}s")
+        self._print_timing_message(
+            f"[TIMING]     save_processing_metadata: {time.time()-_t0:.3f}s"
+        )
+        self._print_timing_message(
+            f"[TIMING]   [Chunk end] Total chunk time: {time.time()-_chunk_start:.3f}s"
+        )
         return self.output
 
 

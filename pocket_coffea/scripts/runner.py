@@ -263,6 +263,15 @@ def _run_without_phase_profiling(function, *args, **kwargs):
             os.environ["POCKET_COFFEA_PROFILE_PHASES"] = saved_profile_flag
 
 
+def _verbosity_for_callable(fun):
+    """Get the workflow verbosity from a bound processor method."""
+    processor_instance = getattr(fun, "__self__", None)
+    try:
+        return int(getattr(processor_instance, "verbose", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 # ---------------------------------------------------------------------------
 # Custom branch tracing — more robust than the built-in coffea version
 # ---------------------------------------------------------------------------
@@ -287,6 +296,8 @@ def traced_branch_printer(fun, events, throw=False):
     name.
     """
     import coffea.nanoevents.trace as _ctrace
+
+    verbose = _verbosity_for_callable(fun)
 
     _enrich_trace_metadata(fun, events)
 
@@ -326,17 +337,20 @@ def traced_branch_printer(fun, events, throw=False):
 
     # --- Ultimate fallback: extract from the form --------------------------
     if len(result) == 0:
-        print("[TRACE] Coffea built-in trace returned 0 branches — "
-              "falling back to form-based branch extraction.")
+        if verbose >= 2:
+            print("[TRACE] Coffea built-in trace returned 0 branches — "
+                  "falling back to form-based branch extraction.")
         form_dict = events.attrs.get("@form", {})
         result.update(_collect_form_branches(form_dict))
-        print(f"[TRACE] Form-based extraction found {len(result)} potential branches.")
+        if verbose >= 2:
+            print(f"[TRACE] Form-based extraction found {len(result)} potential branches.")
 
     _t1 = time.time()
     branches = sorted(result)
-    print(f"[TRACE] Branch tracing completed in {_t1-_t0:.3f}s")
-    print(f"[TRACE] Number of branches identified as needed: {len(branches)}")
-    if branches:
+    if verbose >= 1:
+        print(f"[TRACE] Branch tracing completed in {_t1-_t0:.3f}s")
+        print(f"[TRACE] Number of branches identified as needed: {len(branches)}")
+    if verbose >= 2 and branches:
         print(f"[TRACE] Branches needed:")
         for i, b in enumerate(branches):
             print(f"  [{i:4d}] {b}")
@@ -380,6 +394,14 @@ def _prepare_runner_outputdir(outputdir, executor):
     local_outputdir = _local_cmsconnect_submission_dir(outputdir)
     os.makedirs(local_outputdir, exist_ok=True)
     return local_outputdir
+
+
+def _config_verbosity(config):
+    """Return the configured workflow verbosity without requiring OmegaConf."""
+    try:
+        return int(getattr(config.parameters, "verbose", 0) or 0)
+    except (AttributeError, TypeError, ValueError):
+        return 0
 
 @click.command(context_settings=dict(ignore_unknown_options=True, allow_extra_args=True))
 @click.option('--cfg', required=True, type=str,
@@ -448,8 +470,6 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     if cfg[-3:] == ".py":
         # Load the script
         config = load_config(cfg, save_config=True, outputdir=runner_outputdir)
-        _t1 = time.time()
-        print(f"[TIMING] load_config (.py): {_t1-_t0:.2f}s")
     elif cfg[-4:] == ".pkl":
         config = cloudpickle.load(open(cfg,"rb"))
         if not config.loaded:
@@ -465,7 +485,14 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     else:
         raise sys.exit("Please provide a .py/.pkl configuration file or a YAML job descriptor")
 
-    print(config)
+    runner_verbose = _config_verbosity(config)
+
+    def runner_print(message, level=1):
+        if runner_verbose >= level:
+            print(message)
+
+    runner_print(f"[TIMING] load_config ({cfg.split('.')[-1]}): {time.time()-_t0:.2f}s")
+    runner_print(config, level=2)
     
     # Now loading the executor or from the set of predefined ones, or from the
     # user defined script
@@ -638,11 +665,15 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         # Note: we will filter filesets_groups later after groups are constructed
         # since failed jobs refer to group names, not individual dataset names
 
-    print(f"[TIMING] Config loaded, datasets to process: {len(filesets_to_run)}")
+    runner_print(f"[TIMING] Config loaded, datasets to process: {len(filesets_to_run)}")
     for ds_name, ds_info in filesets_to_run.items():
         nf = len(ds_info["files"])
         nev = ds_info["metadata"]["nevents"]
-        print(f"  [TRACE] Dataset: {ds_name}, files={nf}, events={nev}, sample={ds_info['metadata']['sample']}, year={ds_info['metadata']['year']}")
+        runner_print(
+            f"  [TRACE] Dataset: {ds_name}, files={nf}, events={nev}, "
+            f"sample={ds_info['metadata']['sample']}, year={ds_info['metadata']['year']}",
+            level=2,
+        )
 
     if len(filesets_to_run) == 0:
         print("No datasets to process, closing")
@@ -661,9 +692,13 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
         executor = executor_factory.get()
 
     _t_exec_ready = time.time()
-    print(f"[TIMING] Executor setup & instantiation: {_t_exec_ready-_t_exec_setup:.2f}s")
-    print(f"[TRACE] Executor type: {type(executor).__name__}")
-    print(f"[TRACE] Run options: chunksize={run_options.get('chunksize')}, limit-chunks={run_options.get('limit-chunks')}, scaleout={run_options.get('scaleout')}")
+    runner_print(f"[TIMING] Executor setup & instantiation: {_t_exec_ready-_t_exec_setup:.2f}s")
+    runner_print(f"[TRACE] Executor type: {type(executor).__name__}", level=2)
+    runner_print(
+        f"[TRACE] Run options: chunksize={run_options.get('chunksize')}, "
+        f"limit-chunks={run_options.get('limit-chunks')}, scaleout={run_options.get('scaleout')}",
+        level=2,
+    )
     processor_instance = _get_processor_instance(config.processor_instance)
 
     start_time = time.time()
@@ -696,12 +731,14 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                      processor_instance=processor_instance,
                      trace=trace)
         _t_run_end = time.time()
-        print(f"[TIMING] Processing all datasets together: {_t_run_end-_t_run_start:.2f}s")
+        runner_print(
+            f"[TIMING] Processing all datasets together: {_t_run_end-_t_run_start:.2f}s"
+        )
         
         print(f"Saving output to {outfile.format('all')}")
         _t_save = time.time()
         save(output, outfile.format("all") )
-        print(f"[TIMING] Saving output: {time.time()-_t_save:.2f}s")
+        runner_print(f"[TIMING] Saving output: {time.time()-_t_save:.2f}s")
         print_processing_stats(output, start_time, run_options["scaleout"])
 
     else:
@@ -726,8 +763,11 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
             for dataset, files in filesets_to_group.items():
                 filesets_groups[dataset] = {dataset:files}
 
-            print("All datasets to process:", filesets_groups.keys())
-            print(f"[TIMING] Grouping datasets: {time.time()-_t_group:.2f}s")
+            runner_print(
+                f"[TRACE] All datasets to process: {list(filesets_groups.keys())}",
+                level=2,
+            )
+            runner_print(f"[TIMING] Grouping datasets: {time.time()-_t_group:.2f}s")
         else:
             filesets_groups = {dataset:{dataset:files} for dataset, files in filesets_to_run.items()}
 
@@ -749,10 +789,16 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
             datasets = list(fileset_.keys())
             if len(datasets) == 1:
                 dataset = datasets[0]
-                print(f"[TIMING] Processing group {i_group+1}/{n_groups}: {group_name} (dataset: {dataset})")
+                runner_print(
+                    f"[TIMING] Processing group {i_group+1}/{n_groups}: "
+                    f"{group_name} (dataset: {dataset})"
+                )
                 logging.info(f"Working on dataset: {group_name}")
             else:
-                print(f"[TIMING] Processing group {i_group+1}/{n_groups}: {group_name} ({len(datasets)} datasets)")
+                runner_print(
+                    f"[TIMING] Processing group {i_group+1}/{n_groups}: "
+                    f"{group_name} ({len(datasets)} datasets)"
+                )
                 logging.info(f"Working on group of datasets: {group_name} ({len(datasets)} datasets)")
 
             n_events_tot = sum([int(files["metadata"]["nevents"]) for files in fileset_.values()])
@@ -774,14 +820,17 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                 error_log_file=f"{outputdir}/error/run_{group_name}.err",
                 exit_on_error=False # Continue to next dataset on error
             )
-            print(f"[TIMING] get_runner: {time.time()-_t_get_runner:.2f}s")
+            runner_print(f"[TIMING] get_runner: {time.time()-_t_get_runner:.2f}s")
 
             _t_run_start = time.time()
             output = run(fileset_, treename="Events",
                          processor_instance=processor_instance,
                          trace=trace)
             _t_run_end = time.time()
-            print(f"[TIMING] Coffea Runner processing for {group_name}: {_t_run_end-_t_run_start:.2f}s")
+            runner_print(
+                f"[TIMING] Coffea Runner processing for {group_name}: "
+                f"{_t_run_end-_t_run_start:.2f}s"
+            )
             
             if output is None:
                 logging.error(f"Processing of dataset {group_name} failed, moving to the next one")
@@ -791,7 +840,10 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
                 _t_save = time.time()
                 print(f"Saving output to {outfile.format(group_name)}")
                 save(output, outfile.format(group_name))
-                print(f"[TIMING] Saving output for {group_name}: {time.time()-_t_save:.2f}s")
+                runner_print(
+                    f"[TIMING] Saving output for {group_name}: "
+                    f"{time.time()-_t_save:.2f}s"
+                )
                 print_processing_stats(output, dataset_start_time, run_options["scaleout"])
 
         # Save the list of failed jobs
@@ -810,12 +862,15 @@ def run(cfg,  custom_run_options, outputdir, test, limit_files,
     # Closing the executor if needed
     _t_close = time.time()
     executor_factory.close()
-    print(f"[TIMING] Executor close: {time.time()-_t_close:.2f}s")
+    runner_print(f"[TIMING] Executor close: {time.time()-_t_close:.2f}s")
     
     total_elapsed = time.time() - start_time
-    print(f"[TIMING] ========================================")
-    print(f"[TIMING] TOTAL RUN TIME: {total_elapsed:.2f}s ({total_elapsed/60.:.2f} minutes)")
-    print(f"[TIMING] ========================================")
+    runner_print(f"[TIMING] ========================================")
+    runner_print(
+        f"[TIMING] TOTAL RUN TIME: {total_elapsed:.2f}s "
+        f"({total_elapsed/60.:.2f} minutes)"
+    )
+    runner_print(f"[TIMING] ========================================")
 
 
 

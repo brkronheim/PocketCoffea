@@ -103,10 +103,31 @@ class CalibratorsManager():
             raise ValueError(f"Variation {variation} not available. Available variations: {self.available_variations}")
         
         applied_calibrators = []
+        calibration_probe = getattr(self, "calibration_probe", None)
+
+        def run_calibration_probe(stage, calibrator, returned_collections=None):
+            """Run an optional diagnostic callback without affecting processing."""
+            if calibration_probe is None:
+                return
+            try:
+                calibration_probe(
+                    stage,
+                    calibrator,
+                    variation,
+                    events,
+                    returned_collections,
+                )
+            except Exception as exc:
+                print(
+                    f"[calibrator step probe] failed for {calibrator.name} "
+                    f"({variation}, {stage}): {exc}"
+                )
+
         # Store the original collections before applying the calibrators
         for calibrator in self.calibrator_sequence:
             if debug:
                 print(f"Applying calibrator: {calibrator.name} for variation: {variation}")
+            run_calibration_probe("before", calibrator)
             # If the variation is not handled by the calibrator
             # it will return the nominal collection. 
             # we don't want to control this in the manager, we 
@@ -143,6 +164,7 @@ class CalibratorsManager():
                     events[collection, field] = colls[col]
             # Keep track of the calibrators applied
             applied_calibrators.append(calibrator.name)
+            run_calibration_probe("after", calibrator, colls)
         return events
 
 

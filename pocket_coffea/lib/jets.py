@@ -535,9 +535,14 @@ def get_dijet(jets, taggerVars=True, remnant_jet = False):
         remnant = jets[:, 2:]
 
     for var in fields.keys():
+        value = (
+            ak.zeros_like(dijet.pt)
+            if var == "charge" and "charge" not in ak.fields(dijet)
+            else getattr(dijet, var)
+        )
         fields[var] = ak.where(
             (njet >= 2),
-            getattr(dijet, var),
+            value,
             fields[var]
         )
         
