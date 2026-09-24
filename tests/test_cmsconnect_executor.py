@@ -550,7 +550,7 @@ def test_submit_jobs_generates_bootstrap_safe_yaml_worker(tmp_path):
     assert '--cfg "$JOB_CONFIG"' in script
     assert "config_job.pkl" not in script
     assert 'export POCKET_COFFEA_ANALYSIS_ROOT="$PWD/analysis_src"' in script
-    assert "configurator.parameters.jets_calibration.jet_types.values()" in script
+    assert "relocate_resources(configurator.parameters)" in script
     assert "analysis_root.joinpath(*configured_path.parts[marker_index:])" in script
     assert 'remote_dir = "/" + parsed.path.rsplit("/", 1)[0].lstrip("/")' in script
 
@@ -1118,3 +1118,50 @@ def test_environment_fingerprint_changes_with_package_exclusions(tmp_path):
     second = _environment_cache_fingerprint(env_path, {}, {"tensorflow"})
 
     assert first != second
+
+def test_worker_relocates_nested_bundled_resources(tmp_path):
+    from omegaconf import OmegaConf
+    from omegaconf.errors import MissingMandatoryValue
+    from types import SimpleNamespace
+    import pocket_coffea.executors.executors_cmsconnect as cmsconnect
+
+    root = tmp_path / 'analysis_src'
+    paths = ['params/eff.json', 'params/jets.json', 'MVA/model.onnx']
+    for relative in paths:
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('{}')
+    parameters = OmegaConf.create({
+        'efficiency': '/submit/params/eff.json',
+        'nested': [{'json_path': '/submit/params/jets.json'}],
+        'model': '/submit/params/../MVA/model.onnx',
+        'config_dir': '/submit/params',
+        'external': '/cvmfs/calibration.json',
+        'url': 'root://host//store/file.root',
+        'lepton_scale_factors': {'electron_sf': {'trigger_sf': {
+            '2016_PreVFP': {'name': '???'},
+        }}},
+        'optional_list': ['???', '${unavailable_resource}', '/submit/params/eff.json'],
+        'optional_resolver': '${not_registered_on_worker:resource}',
+        'efficiency_alias': '${efficiency}',
+    })
+    source = Path(cmsconnect.__file__).read_text()
+    start = source.index('relocated_paths = []\n\ndef relocate_resources')
+    end = source.index('\nif relocated_paths:', start)
+    exec(source[start:end], {
+        'os': os, 'Path': Path, 'analysis_root': root,
+        'configurator': SimpleNamespace(parameters=parameters),
+    })
+    assert parameters.efficiency == str(root / paths[0])
+    assert parameters.nested[0].json_path == str(root / paths[1])
+    assert parameters.model == str(root / paths[2])
+    assert parameters.config_dir == str(root / 'params')
+    assert parameters.external == '/cvmfs/calibration.json'
+    assert parameters.url == 'root://host//store/file.root'
+    raw = OmegaConf.to_container(parameters, resolve=False)
+    assert raw['lepton_scale_factors']['electron_sf']['trigger_sf']['2016_PreVFP']['name'] == '???'
+    assert raw['optional_list'] == ['???', '${unavailable_resource}', str(root / paths[0])]
+    assert raw['optional_resolver'] == '${not_registered_on_worker:resource}'
+    assert parameters.efficiency_alias == str(root / paths[0])
+    with pytest.raises(MissingMandatoryValue, match='Missing mandatory value'):
+        _ = parameters.lepton_scale_factors.electron_sf.trigger_sf['2016_PreVFP'].name

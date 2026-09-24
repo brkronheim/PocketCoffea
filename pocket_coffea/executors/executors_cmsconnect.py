@@ -916,22 +916,41 @@ with config_path.open("rb") as handle:
     configurator = cloudpickle.load(handle)
 
 relocated_paths = []
-for calibrations_by_year in configurator.parameters.jets_calibration.jet_types.values():
-    for calibration in calibrations_by_year.values():
-        if "json_path" not in calibration:
+
+def relocate_resources(node):
+    # Configurations are nested DictConfig/ListConfig objects. Only relocate
+    # absolute paths with a matching staged resource; URLs and CVMFS stay valid.
+    from collections.abc import MutableMapping, MutableSequence
+    from omegaconf.errors import MissingMandatoryValue, InterpolationResolutionError
+    if isinstance(node, MutableMapping):
+        keys = list(node)
+    elif isinstance(node, MutableSequence):
+        keys = range(len(node))
+    else:
+        return
+    for key in keys:
+        try:
+            value = node[key]
+        except (MissingMandatoryValue, InterpolationResolutionError):
+            # Unused eras may have mandatory placeholders or interpolations
+            # unavailable on workers. Relocation is not config validation:
+            # preserve them so an actual consumer still raises if needed.
             continue
-        configured_path = Path(str(calibration["json_path"]))
-        if configured_path.exists():
+        if not isinstance(value, str) or not os.path.isabs(value):
+            relocate_resources(value)
             continue
+        configured_path = Path(os.path.normpath(value))
         for marker in ("params", "MVA"):
             if marker not in configured_path.parts:
                 continue
             marker_index = configured_path.parts.index(marker)
             bundled_path = analysis_root.joinpath(*configured_path.parts[marker_index:])
-            if bundled_path.exists():
-                calibration["json_path"] = str(bundled_path)
+            if bundled_path.exists() and str(bundled_path) != value:
+                node[key] = str(bundled_path)
                 relocated_paths.append((configured_path, bundled_path))
             break
+
+relocate_resources(configurator.parameters)
 
 if relocated_paths:
     temporary_path = config_path.with_suffix(".pkl.tmp")
@@ -939,7 +958,7 @@ if relocated_paths:
         cloudpickle.dump(configurator, handle)
     os.replace(temporary_path, config_path)
     for configured_path, bundled_path in relocated_paths:
-        print("Relocated calibration resource: %s -> %s" % (configured_path, bundled_path))
+        print("Relocated analysis resource: %s -> %s" % (configured_path, bundled_path))
 PY
 """
         script += f"""
